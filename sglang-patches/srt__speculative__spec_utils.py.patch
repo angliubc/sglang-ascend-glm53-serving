@@ -1,0 +1,12 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/speculative/spec_utils.py /data/models/mtp_experiment_0907/sglang/srt/speculative/spec_utils.py
+--- /tmp/stock_sglang/sglang/srt/speculative/spec_utils.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/speculative/spec_utils.py	2026-09-09 17:59:16.701297107 +0800
+@@ -642,7 +642,7 @@
+ 
+     # non_blocking is safe: the bitmask is pinned (see xgrammar_backend), and stream
+     # order keeps the copy ahead of the sampler's apply_vocab_mask.
+-    vocab_mask = vocab_mask.to(device, non_blocking=True)
++    vocab_mask = vocab_mask.to(device)  # 0909-fix: pageable src + async H2D + free = MTE out-of-range
+     # Otherwise the extend stage's leftover mask is applied instead.
+     sampling_info.grammar_mask = None
+     return GrammarMask(grammar, vocab_mask)

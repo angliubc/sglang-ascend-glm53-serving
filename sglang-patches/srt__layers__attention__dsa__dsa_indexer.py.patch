@@ -1,0 +1,12 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/layers/attention/dsa/dsa_indexer.py /data/models/mtp_experiment_0907/sglang/srt/layers/attention/dsa/dsa_indexer.py
+--- /tmp/stock_sglang/sglang/srt/layers/attention/dsa/dsa_indexer.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/layers/attention/dsa/dsa_indexer.py	2026-08-30 22:31:46.000000000 +0800
+@@ -1902,3 +1902,8 @@
+             raise NotImplementedError("DSA indexer only supports CUDA, HIP, and NPU")
+         topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+         return maybe_capture_indexer_topk(layer_id, topk_result)
++
++
++# --- glm5_next port: dual-stream threshold (NPU: disabled) ---
++DUAL_STREAM_TOKEN_THRESHOLD = 1 << 40
++

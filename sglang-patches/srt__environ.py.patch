@@ -1,0 +1,13 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/environ.py /data/models/mtp_experiment_0907/sglang/srt/environ.py
+--- /tmp/stock_sglang/sglang/srt/environ.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/environ.py	2026-09-09 15:42:21.912416332 +0800
+@@ -1270,6 +1270,9 @@
+     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
+     # Think tokens budget: negative means unlimited, >= 0 caps thinking tokens
+     SGLANG_MAX_THINK_TOKENS = EnvInt(-1)
++    # Minimum thinking tokens before the think-end sequence is allowed; 0 = off.
++    # Blocks empty-thinking turns that degenerate into verbatim context copying.
++    SGLANG_MIN_THINK_TOKENS = EnvInt(0)
+     SGLANG_PATCH_TOKENIZER = EnvBool(True)
+     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
+     SGLANG_DEFAULT_THINKING = EnvBool(False)

@@ -1,0 +1,38 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/model_executor/pool_configurator.py /data/models/mtp_experiment_0907/sglang/srt/model_executor/pool_configurator.py
+--- /tmp/stock_sglang/sglang/srt/model_executor/pool_configurator.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/model_executor/pool_configurator.py	2026-09-10 20:41:29.882624633 +0800
+@@ -280,11 +280,33 @@
+                     * kv_size
+                 )
+ 
++            # W4A8_C8_KV experiment: the latent is stored as int8 656B rows
++            # with inline bf16 scales (npu_kv_quant_sparse_flash_attention),
++            # and W4A8_C8_DENSE allocates rows only for the DSA layers.
++            self._c8_num_bufs = None
++            if (
++                __import__("os").environ.get("W4A8_C8_KV") == "1"
++                and model_config.kv_lora_rank == 512
++                and model_config.qk_rope_head_dim == 0
++            ):
++                n_bufs = effective_num_layers
++                if __import__("os").environ.get("W4A8_C8_DENSE") == "1":
++                    hf_cfg = model_config.hf_config
++                    lac = getattr(hf_cfg, "linear_attn_config", None) or {}
++                    kda = set(lac.get("kda_layers", []))
++                    n_bufs = sum(
++                        1
++                        for i in range(getattr(hf_cfg, "num_hidden_layers", 0))
++                        if i not in kda
++                    )
++                self._c8_num_bufs = n_bufs
++                cell_size = 656 * n_bufs
++
+             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
+             if is_deepseek_dsa(model_config.hf_config):
+                 cell_size += self._compute_dsa_indexer_cell_size(
+                     kvc=kvc,
+-                    num_layers=num_layers,
++                    num_layers=self._c8_num_bufs or num_layers,
+                 )
+         elif is_minimax_sparse(model_config.hf_config):
+             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool

@@ -1,0 +1,21 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/mem_cache/unified_radix_cache.py /data/models/mtp_experiment_0907/sglang/srt/mem_cache/unified_radix_cache.py
+--- /tmp/stock_sglang/sglang/srt/mem_cache/unified_radix_cache.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/mem_cache/unified_radix_cache.py	2026-09-09 12:57:47.132476545 +0800
+@@ -2628,13 +2628,17 @@
+             finish_count = finish_count_tensor.item()
+ 
+         # Process completed acks
++        _committed = 0  # hicache-debug
+         while finish_count > 0:
+             ack = cc.ack_write_queue.pop(0)
+             ack.finish_event.synchronize()
+             for ack_id in ack.node_ids:
+                 self._finish_write_through_ack(ack_id)
++                _committed += 1
+             self._log_write_ack_metrics(ack)
+             finish_count -= 1
++        if _committed:
++            logger.debug("hicache-debug: committed %d write-through acks", _committed)
+ 
+     def _log_write_ack_metrics(self, ack: HiCacheAck) -> None:
+         """Record D->H backup volume and duration for a completed write ack."""

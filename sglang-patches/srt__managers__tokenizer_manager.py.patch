@@ -1,0 +1,14 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/managers/tokenizer_manager.py /data/models/mtp_experiment_0907/sglang/srt/managers/tokenizer_manager.py
+--- /tmp/stock_sglang/sglang/srt/managers/tokenizer_manager.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/managers/tokenizer_manager.py	2026-09-09 09:29:06.574254281 +0800
+@@ -2205,7 +2205,9 @@
+                 # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
+                 if rid.startswith(HEALTH_CHECK_RID_PREFIX):
+                     continue
+-                logger.error(
++                # Benign race after client abort/cancel: late outputs for a
++                # request whose state was already dropped. Not actionable.
++                logger.debug(
+                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
+                 )
+                 continue

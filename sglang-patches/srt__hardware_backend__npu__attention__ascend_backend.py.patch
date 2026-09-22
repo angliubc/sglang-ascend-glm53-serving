@@ -1,0 +1,645 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/hardware_backend/npu/attention/ascend_backend.py /data/models/mtp_experiment_0907/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
+--- /tmp/stock_sglang/sglang/srt/hardware_backend/npu/attention/ascend_backend.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/hardware_backend/npu/attention/ascend_backend.py	2026-09-10 19:38:19.284326158 +0800
+@@ -938,8 +938,11 @@
+             query=q_nope_prev,
+             key=k_nope,
+             value=k_nope,
+-            query_rope=q_rope_prev,
+-            key_rope=k_pe,
++            **(
++                dict(query_rope=q_rope_prev, key_rope=k_pe)
++                if self.qk_rope_head_dim > 0
++                else {}
++            ),
+             sparse_indices=topk_indices_prev,
+             scale_value=layer.scaling,
+             actual_seq_lengths_query=actual_seq_qlen_prev.to(
+@@ -960,8 +963,11 @@
+             query=q_nope_next,
+             key=k_nope,
+             value=k_nope,
+-            query_rope=q_rope_next,
+-            key_rope=k_pe,
++            **(
++                dict(query_rope=q_rope_next, key_rope=k_pe)
++                if self.qk_rope_head_dim > 0
++                else {}
++            ),
+             sparse_indices=topk_indices_next,
+             scale_value=layer.scaling,
+             actual_seq_lengths_query=actual_seq_qlen_next.to(
+@@ -1082,12 +1088,30 @@
+ 
+         if save_kv_cache:
+             k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
+-            k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
++            k_rope = (
++    k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
++    if self.qk_rope_head_dim > 0
++    else k_rope.view(k_rope.shape[0], layer.tp_k_head_num, 0)
++)
+             self.token_to_kv_pool.set_kv_buffer(
+                 layer, forward_batch.out_cache_loc, k, k_rope
+             )
+         q_nope, q_pe = q, q_rope
+-        k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
++        c8_kv = getattr(self.token_to_kv_pool, "c8_kv", False)
++        if c8_kv:
++            # W4A8_C8_KV: int8 latent pool with inline combine-mode scales,
++            # consumed by npu_kv_quant_sparse_flash_attention below.
++            k_pool_c8 = self.token_to_kv_pool.get_c8_kv_pool(layer.layer_id)
++        else:
++            k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
++            # PA_BSND layout demands a 4-D paged view; some pools return flat 3-D
++            # (tokens, heads, dim) with non-page-aligned spare slots (mirrors
++            # _forward_glm_short_context).
++            if k_nope.dim() == 3:
++                num_pages = k_nope.shape[0] // self.page_size
++                k_nope = k_nope[: num_pages * self.page_size].view(
++                    num_pages, self.page_size, layer.tp_k_head_num, k_nope.shape[-1]
++                )
+ 
+         if is_prefill:
+             if self.forward_metadata.actual_seq_lengths_q is not None:
+@@ -1124,6 +1148,10 @@
+         else:
+             actual_seq_lengths_kv = self.forward_metadata.seq_lens
+ 
++        if c8_kv and is_dsa_enable_prefill_cp():
++            raise RuntimeError(
++                "W4A8_C8_KV int8 KV cache does not support DSA prefill CP"
++            )
+         if (
+             is_prefill
+             and is_dsa_enable_prefill_cp()
+@@ -1143,12 +1171,74 @@
+             if topk_indices is not None:
+                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+             topk_indices = _expand_dsa_sparse_indices(topk_indices)
+-            attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
+-                query=q_nope,
++            if __import__("os").environ.get("SGLANG_DEBUG_DSA"):
++                _ti = topk_indices
++                _fm = forward_batch.forward_mode
++                logger.warning(
++                    f"DSA_DEBUG mode={_fm} q={tuple(q_nope.shape)} k={tuple(k_nope.shape)} "
++                    f"topk={None if _ti is None else tuple(_ti.shape)} "
++                    f"tmin={None if _ti is None else int(_ti.min())} "
++                    f"tmax={None if _ti is None else int(_ti.max())} "
++                    f"qlen={actual_seq_qlen.tolist()[:6]} kvlen={actual_seq_lengths_kv.tolist()[:6]} "
++                    f"bs={forward_batch.batch_size} layer={getattr(layer, 'layer_id', '?')}"
++                )
++            if c8_kv:
++                attn_out = torch.ops.npu.npu_kv_quant_sparse_flash_attention(
++                    query=torch.cat(
++                        [
++                            q_nope,
++                            q_nope.new_zeros(q_nope.shape[0], layer.tp_q_head_num, 64),
++                        ],
++                        dim=-1,
++                    ),
++                    key=k_pool_c8,
++                    value=k_pool_c8,
++                    sparse_indices=topk_indices,
++                    scale_value=layer.scaling,
++                    key_quant_mode=2,
++                    value_quant_mode=2,
++                    actual_seq_lengths_query=actual_seq_qlen.to(
++                        device=q_nope.device, dtype=torch.int32
++                    ),
++                    actual_seq_lengths_kv=actual_seq_lengths_kv.to(
++                        device=q_nope.device, dtype=torch.int32
++                    ),
++                    block_table=self.forward_metadata.block_tables,
++                    sparse_block_size=1,
++                    layout_query="TND",
++                    layout_kv="PA_BSND",
++                    sparse_mode=3,
++                    attention_mode=2,
++                    quant_scale_repo_mode=1,
++                    tile_size=128,
++                    rope_head_dim=64,
++                )
++            else:
++                attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
++                    query=q_nope,
+                 key=k_nope,
+                 value=k_nope,
+-                query_rope=q_pe,
+-                key_rope=k_pe,
++                **(
++                    dict(query_rope=q_pe, key_rope=k_pe)
++                    if self.qk_rope_head_dim > 0
++                    # NoPE: this CANN build's tiling rejects absent rope
++                    # inputs, so materialize zero rope buffers (semantically
++                    # inert), mirroring _forward_glm_short_context.
++                    else dict(
++                        query_rope=torch.zeros(
++                            q_nope.shape[0],
++                            layer.tp_q_head_num,
++                            64,
++                            dtype=q_nope.dtype,
++                            device=q_nope.device,
++                        ),
++                        key_rope=torch.zeros(
++                            (*k_nope.shape[:-1], 64),
++                            dtype=k_nope.dtype,
++                            device=k_nope.device,
++                        ),
++                    )
++                ),
+                 sparse_indices=topk_indices,
+                 scale_value=layer.scaling,
+                 actual_seq_lengths_query=actual_seq_qlen.to(
+@@ -1210,19 +1300,26 @@
+                 topk_indices,
+             )
+         if (
++            # GLM-5.3 on NPU: route TARGET_VERIFY and DRAFT_EXTEND_V2 through
++            # per-draft-position _npu_paged_attention_mla (proven decode
++            # recipe at page_size 64). forward_mtp's fused paged ops reject
++            # blockSize=64 in the no-quant GQA scenario, and its unpaged V1
++            # TND fallback only supports headDim 64/128/192 (MLA latent is
++            # 512). NOTE: assumes an unquantized (bf16) latent KV cache, as
++            # used by GLM-5.3 W8A8 weight-only quant — for quantized-KV
++            # models (e.g. DeepSeek W8A8 KV) forward_mtp remains the path.
+             forward_batch.forward_mode.is_target_verify()
+             or forward_batch.forward_mode.is_draft_extend_v2()
+         ):
+-            return self.forward_mtp(
++            return self.forward_verify_paged_mla(
+                 q,
+                 k,
+                 v,
+                 layer,
+                 forward_batch,
+                 save_kv_cache,
+-                q_rope=q_rope,
+-                k_rope=k_rope,
+-                sinks=sinks,
++                q_rope,
++                k_rope,
+             )
+ 
+         if not self.use_mla:
+@@ -1970,6 +2067,182 @@
+ 
+         return attn_output
+ 
++    def _forward_glm_short_context(
++        self, q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
++    ):
++        # Below index_topk=2048 every causally visible token is selected, so
++        # dense visibility built from device-side positions matches the DSA
++        # output exactly while staying graph-replay safe: every length the
++        # kernel reads lives in a device tensor the graph runner refreshes
++        # in place (positions, actual_seq_lengths_q, block_tables); no
++        # captured CPU sequence-length constants are involved. The sparse
++        # kernel's tiling rejects absent rope inputs, so zero rope buffers
++        # are materialized inside the call (their fill is captured too, and
++        # zeros contribute nothing to the attention logits).
++        if self.max_context_len > 2048 or self.qk_rope_head_dim != 0:
++            raise ValueError("GLM short-context MTP requires context <=2048 and NoPE")
++        if save_kv_cache:
++            k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
++            k_rope = k_rope.view(k_rope.shape[0], layer.tp_k_head_num, 0)
++            self.token_to_kv_pool.set_kv_buffer(
++                layer, forward_batch.out_cache_loc, k, k_rope
++            )
++        q_nope = q
++        k_nope, _ = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
++        # PA_BSND layout demands a 4-D paged view (pages, page_size, heads, dim).
++        # Some pools hand the buffer back already paged (4-D), others flat
++        # (tokens, heads, dim) — possibly with non-page-aligned spare slots.
++        if k_nope.dim() == 3:
++            num_pages = k_nope.shape[0] // self.page_size
++            k_nope = k_nope[: num_pages * self.page_size].view(
++                num_pages, self.page_size, layer.tp_k_head_num, k_nope.shape[-1]
++            )
++        num_tokens = q_nope.shape[0]
++        positions = forward_batch.positions.reshape(-1)[:num_tokens]
++
++        if self.forward_metadata.actual_seq_lengths_q is not None:
++            actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
++        elif forward_batch.forward_mode.is_extend() and not (
++            forward_batch.forward_mode.is_draft_extend_v2()
++            or forward_batch.forward_mode.is_target_verify()
++        ):
++            actual_seq_qlen = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
++        elif (
++            forward_batch.forward_mode.is_draft_extend_v2()
++            or forward_batch.forward_mode.is_target_verify()
++        ):
++            ndt = self.speculative_num_draft_tokens
++            actual_seq_qlen = torch.arange(
++                ndt, num_tokens + 1, ndt, dtype=torch.int32, device=q_nope.device
++            )
++        else:
++            actual_seq_qlen = torch.arange(
++                1, num_tokens + 1, dtype=torch.int32, device=q_nope.device
++            )
++        actual_seq_qlen = actual_seq_qlen.to(device=q_nope.device, dtype=torch.int32)
++        # Per-request kv length = position of its last query token + 1; stays
++        # correct across graph replays because positions is a live buffer.
++        seq_kvlen = (positions[(actual_seq_qlen - 1).to(torch.int64)] + 1).to(
++            torch.int32
++        )
++
++        indices = torch.arange(2048, device=q_nope.device, dtype=torch.int32)
++        indices = indices.unsqueeze(0).expand(num_tokens, -1)
++        indices = (
++            torch.where(indices <= positions[:, None], indices, -1)
++            .unsqueeze(1)
++            .contiguous()
++        )
++        q_zero_rope = torch.zeros(
++            num_tokens, layer.tp_q_head_num, 64, dtype=q_nope.dtype, device=q_nope.device
++        )
++        k_zero_rope = torch.zeros(
++            (*k_nope.shape[:-1], 64), dtype=k_nope.dtype, device=k_nope.device
++        )
++        attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
++            query=q_nope,
++            key=k_nope,
++            value=k_nope,
++            query_rope=q_zero_rope,
++            key_rope=k_zero_rope,
++            sparse_indices=indices,
++            scale_value=layer.scaling,
++            actual_seq_lengths_query=actual_seq_qlen,
++            actual_seq_lengths_kv=seq_kvlen,
++            block_table=self.forward_metadata.block_tables,
++            sparse_block_size=1,
++            layout_query="TND",
++            layout_kv="PA_BSND",
++            sparse_mode=3,
++            attention_mode=2,
++            return_softmax_lse=False,
++        )
++        return attn_out
++
++    def forward_verify_paged_mla(
++        self,
++        q: torch.Tensor,
++        k: torch.Tensor,
++        v: torch.Tensor,
++        layer: RadixAttention,
++        forward_batch: ForwardBatch,
++        save_kv_cache: bool = True,
++        q_rope: Optional[torch.Tensor] = None,
++        k_rope: Optional[torch.Tensor] = None,
++    ):
++        """TARGET_VERIFY for GLM MLA layers.
++
++        The fused paged extend ops (aclnnFusedInferAttentionScoreV3/V4) reject
++        blockSize=64 in the no-quant GQA scenario, and the unpaged V1 TND path
++        only supports headDim 64/128/192 (the MLA latent is 512). Instead, run
++        the proven decode recipe — torch_npu._npu_paged_attention_mla at
++        page_size 64 — once per draft position: draft token j attends
++        prefix + (j + 1) tokens, which is exactly the verify causal
++        semantics. The draft tokens' KV is written by set_kv_buffer below
++        (same as decode), so the kernel reads the full cache."""
++        if __import__("os").environ.get("SGLANG_GLM_MTP_SHORT_CONTEXT") == "1":
++            return self._forward_glm_short_context(
++                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
++            )
++        if save_kv_cache:
++            self.token_to_kv_pool.set_kv_buffer(
++                layer, forward_batch.out_cache_loc, k, k_rope
++            )
++        ndt = int(
++            getattr(forward_batch.spec_info, "draft_token_num", None)
++            or self.speculative_num_draft_tokens
++        )
++        bs = forward_batch.batch_size
++        num_tokens = q.shape[0]
++        kv_c = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
++        k_pe = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
++        kv_c_and_k_pe_cache = torch.cat([kv_c, k_pe], dim=-1)
++        kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
++            -1,
++            self.page_size,
++            layer.tp_k_head_num,
++            self.kv_lora_rank + self.qk_rope_head_dim,
++        )
++        if q_rope is not None and self.qk_rope_head_dim > 0:
++            q = torch.cat([q, q_rope], dim=-1)
++        head_dim = q.numel() // (num_tokens * layer.tp_q_head_num)
++        q_full = q.view(bs, ndt, layer.tp_q_head_num, head_dim)
++        seq_lens_int = self.forward_metadata.seq_lens_cpu_int
++        if hasattr(seq_lens_int, "tolist"):
++            seq_lens_int = seq_lens_int.tolist()
++        seq_base = [int(s) - ndt for s in seq_lens_int[:bs]]
++        attn_output = torch.empty(
++            [num_tokens, layer.tp_q_head_num, self.kv_lora_rank],
++            dtype=q.dtype,
++            device=q.device,
++        )
++        out_view = attn_output.view(bs, ndt, layer.tp_q_head_num, self.kv_lora_rank)
++        for j in range(ndt):
++            ctx_lens = torch.tensor(
++                [s + (j + 1) for s in seq_base],
++                dtype=torch.int32,
++            )
++            out_j = torch.empty(
++                [bs, layer.tp_q_head_num, self.kv_lora_rank],
++                dtype=q.dtype,
++                device=q.device,
++            )
++            torch_npu._npu_paged_attention_mla(
++                query=q_full[:, j].contiguous(),
++                key_cache=kv_c_and_k_pe_cache,
++                num_kv_heads=layer.tp_k_head_num,
++                num_heads=layer.tp_q_head_num,
++                scale_value=layer.scaling,
++                block_table=self.forward_metadata.block_tables,
++                context_lens=ctx_lens,
++                mla_vheadsize=self.kv_lora_rank,
++                out=out_j,
++            )
++            out_view[:, j] = out_j
++        return attn_output.view(
++            num_tokens, layer.tp_q_head_num * self.kv_lora_rank
++        )
++
+     def forward_mtp(
+         self,
+         q,
+@@ -1985,7 +2258,11 @@
+         if save_kv_cache:
+             if self.use_mla:
+                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
+-                k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
++                k_rope = (
++    k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
++    if self.qk_rope_head_dim > 0
++    else k_rope.view(k_rope.shape[0], layer.tp_k_head_num, 0)
++)
+                 self.token_to_kv_pool.set_kv_buffer(
+                     layer, forward_batch.out_cache_loc, k, k_rope
+                 )
+@@ -2107,22 +2384,34 @@
+         else:
+             c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+             if is_fia_nz():
+-                k_rope_cache = _reshape_kv_for_fia_nz(
+-                    k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
++                k_rope_cache = (
++                    _reshape_kv_for_fia_nz(
++                        k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
++                    )
++                    if self.qk_rope_head_dim > 0
++                    else None
+                 )
+                 c_kv_cache = _reshape_kv_for_fia_nz(
+                     c_kv, layer.tp_v_head_num, self.kv_lora_rank, self.page_size
+                 )
+             else:
+-                k_rope_cache = k_rope.view(
+-                    -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
++                k_rope_cache = (
++                    k_rope.view(
++                        -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
++                    )
++                    if self.qk_rope_head_dim > 0
++                    else None
+                 )
+                 c_kv_cache = c_kv.view(
+                     -1, layer.tp_v_head_num, self.page_size, self.kv_lora_rank
+                 )
+ 
+             q_nope = q.view(-1, layer.tp_q_head_num, self.kv_lora_rank).contiguous()
+-            q_rope = q_rope.view(-1, layer.tp_q_head_num, self.qk_rope_head_dim)
++            q_rope = (
++    q_rope.view(-1, layer.tp_q_head_num, self.qk_rope_head_dim)
++    if self.qk_rope_head_dim > 0
++    else q_rope.view(q_rope.shape[0], layer.tp_q_head_num, 0)
++)
+             if not self.graph_mode:
+                 num_token_padding = q.shape[0]
+                 q_nope = q_nope[: forward_batch.num_token_non_padded_cpu]
+@@ -2182,47 +2471,42 @@
+                 q_nope = torch.cat([q_nope, nope_padding], dim=1).contiguous()
+                 q_rope = torch.cat([q_rope, rope_padding], dim=1).contiguous()
+ 
+-            workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
++            # aclnnFusedInferAttentionScoreV3/V4 reject blockSize=64 in the
++            # no-quant GQA + paged scenario (EZ9999 CheckFeatureBlockSize:
++            # blockSize must be a 128 multiple), and page_size is pinned to 64
++            # by the GLM KV pool. Follow the unpaged MLA extend path instead:
++            # gather the paged latent KV into a flat tensor and call the V1 op
++            # without block_table (page attention disabled -> no blockSize
++            # constraint). sparse_mode=3 (causal, bottom-right aligned) gives
++            # exactly the verify semantics: draft token j attends prefix +
++            # draft tokens 0..j.
++            bt = block_table.long()
++            kv_lens_t = torch.tensor(
++                actual_seq_lengths_kv[: bt.shape[0]], device=bt.device
++            )
++            max_kv = int(kv_lens_t.max().item())
++            _ar = torch.arange(max_kv, device=bt.device)
++            _page_ids = bt[:, _ar // self.page_size]  # [bs, max_kv]
++            _flat_idx = _page_ids * self.page_size + (_ar % self.page_size)
++            _valid = _ar[None, :] < kv_lens_t[:, None]
++            _flat_idx = _flat_idx[_valid]  # row-major per request
++            kv_flat = c_kv.view(-1, self.kv_lora_rank)[_flat_idx]
++            kv_flat = kv_flat.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
++            kv_boundaries = np.cumsum(actual_seq_lengths_kv[: bt.shape[0]]).tolist()
++            attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                 q_nope,
+-                c_kv_cache,
+-                c_kv_cache,
+-                query_rope=q_rope,
+-                key_rope=k_rope_cache,
++                kv_flat,
++                kv_flat,
+                 num_heads=self.q_head_num_padding,
+                 num_key_value_heads=layer.tp_k_head_num,
+                 input_layout="TND",
+-                scale=layer.scaling,
+-                antiquant_mode=0,
+-                antiquant_scale=None,
+-                block_table=block_table,
+-                block_size=self.page_size,
+                 sparse_mode=3,
+                 atten_mask=self.mtp_mask,
+-                actual_seq_lengths=actual_seq_lengths,
+-                actual_seq_lengths_kv=actual_seq_lengths_kv,
+-            )
+-            attn_output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
+-            softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
+-            torch_npu.npu_fused_infer_attention_score.out(
+-                q_nope,
+-                c_kv_cache,
+-                c_kv_cache,
+-                query_rope=q_rope,
+-                key_rope=k_rope_cache,
+-                num_heads=self.q_head_num_padding,
+-                num_key_value_heads=layer.tp_k_head_num,
+-                input_layout="TND",
++                actual_seq_lengths=actual_seq_lengths.tolist()
++                if hasattr(actual_seq_lengths, "tolist")
++                else list(actual_seq_lengths),
++                actual_seq_lengths_kv=kv_boundaries,
+                 scale=layer.scaling,
+-                antiquant_mode=0,
+-                antiquant_scale=None,
+-                block_table=block_table,
+-                block_size=self.page_size,
+-                sparse_mode=3,
+-                atten_mask=self.mtp_mask,
+-                actual_seq_lengths=actual_seq_lengths,
+-                actual_seq_lengths_kv=actual_seq_lengths_kv,
+-                workspace=workspace,
+-                out=[attn_output, softmax_lse],
+             )
+             attn_output = attn_output[:, : layer.tp_q_head_num, :]
+             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+@@ -2257,7 +2541,11 @@
+         if save_kv_cache:
+             if self.use_mla:
+                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
+-                k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
++                k_rope = (
++    k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
++    if self.qk_rope_head_dim > 0
++    else k_rope.view(k_rope.shape[0], layer.tp_k_head_num, 0)
++)
+                 self.token_to_kv_pool.set_kv_buffer(
+                     layer, forward_batch.out_cache_loc, k, k_rope
+                 )
+@@ -2424,22 +2712,34 @@
+         else:
+             c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+             if is_fia_nz():
+-                k_rope_cache = _reshape_kv_for_fia_nz(
+-                    k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
++                k_rope_cache = (
++                    _reshape_kv_for_fia_nz(
++                        k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
++                    )
++                    if self.qk_rope_head_dim > 0
++                    else None
+                 )
+                 c_kv_cache = _reshape_kv_for_fia_nz(
+                     c_kv, layer.tp_v_head_num, self.kv_lora_rank, self.page_size
+                 )
+             else:
+-                k_rope_cache = k_rope.view(
+-                    -1, self.page_size, layer.tp_k_head_num * self.qk_rope_head_dim
++                k_rope_cache = (
++                    k_rope.view(
++                        -1, self.page_size, layer.tp_k_head_num * self.qk_rope_head_dim
++                    )
++                    if self.qk_rope_head_dim > 0
++                    else None
+                 )
+                 c_kv_cache = c_kv.view(
+                     -1, self.page_size, layer.tp_k_head_num * self.kv_lora_rank
+                 )
+ 
+             q_nope = q.view(-1, 1, layer.tp_q_head_num, self.kv_lora_rank).contiguous()
+-            q_rope = q_rope.view(-1, 1, layer.tp_q_head_num, self.qk_rope_head_dim)
++            q_rope = (
++    q_rope.view(-1, 1, layer.tp_q_head_num, self.qk_rope_head_dim)
++    if self.qk_rope_head_dim > 0
++    else q_rope.view(q_rope.shape[0], 1, layer.tp_q_head_num, 0)
++)
+ 
+             assert (
+                 self.q_head_num_padding is None
+@@ -2470,8 +2770,11 @@
+                 q_nope,
+                 c_kv_cache,
+                 c_kv_cache,
+-                query_rope=q_rope,
+-                key_rope=k_rope_cache,
++                **(
++                    dict(query_rope=q_rope, key_rope=k_rope_cache)
++                    if self.qk_rope_head_dim > 0
++                    else {}
++                ),
+                 num_heads=self.q_head_num_padding,
+                 num_key_value_heads=layer.tp_k_head_num,
+                 block_table=self.forward_metadata.block_tables,
+@@ -2490,8 +2793,11 @@
+                 q_nope,
+                 c_kv_cache,
+                 c_kv_cache,
+-                query_rope=q_rope,
+-                key_rope=k_rope_cache,
++                **(
++                    dict(query_rope=q_rope, key_rope=k_rope_cache)
++                    if self.qk_rope_head_dim > 0
++                    else {}
++                ),
+                 num_heads=self.q_head_num_padding,
+                 num_key_value_heads=layer.tp_k_head_num,
+                 block_table=self.forward_metadata.block_tables,
+@@ -2525,6 +2831,13 @@
+         slopes: Optional[torch.Tensor] = None,
+         **kwargs,
+     ):
++        if (
++            self.use_mla
++            and __import__("os").environ.get("SGLANG_GLM_MTP_SHORT_CONTEXT") == "1"
++        ):
++            return self._forward_glm_short_context(
++                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
++            )
+         if is_mla_preprocess_enabled() and self.use_mla:
+             # MLAPO does saving kv_cache
+             save_kv_cache = False
+@@ -2805,17 +3118,30 @@
+                     kv_c = kv_c.view(
+                         -1, self.page_size, layer.tp_k_head_num * self.kv_lora_rank
+                     )
+-                    k_pe = k_pe.view(
+-                        -1, self.page_size, layer.tp_k_head_num * self.qk_rope_head_dim
++                    k_pe = (
++                        k_pe.view(
++                            -1, self.page_size, layer.tp_k_head_num * self.qk_rope_head_dim
++                        )
++                        if self.qk_rope_head_dim > 0
++                        else None
+                     )
+                 q = q.view(
+                     forward_batch.batch_size, -1, layer.tp_q_head_num, self.kv_lora_rank
+                 )
+-                q_rope = q_rope.view(
+-                    forward_batch.batch_size,
+-                    -1,
+-                    layer.tp_q_head_num,
+-                    self.qk_rope_head_dim,
++                q_rope = (
++                    q_rope.view(
++                        forward_batch.batch_size,
++                        -1,
++                        layer.tp_q_head_num,
++                        self.qk_rope_head_dim,
++                    )
++                    if self.qk_rope_head_dim > 0
++                    else q_rope.view(
++                        forward_batch.batch_size,
++                        q_rope.shape[0] // forward_batch.batch_size,
++                        layer.tp_q_head_num,
++                        0,
++                    )
+                 )
+                 if (layer.tp_q_head_num & (layer.tp_q_head_num - 1)) != 0:
+                     power_of_2_head = next_power_of_2(layer.tp_q_head_num)
+@@ -2840,8 +3166,11 @@
+                     q,
+                     kv_c,
+                     kv_c,
+-                    query_rope=q_rope,
+-                    key_rope=k_pe,
++                    **(
++                        dict(query_rope=q_rope, key_rope=k_pe)
++                        if self.qk_rope_head_dim > 0
++                        else {}
++                    ),
+                     num_heads=tp_q_head_num,
+                     num_key_value_heads=layer.tp_k_head_num,
+                     input_layout="BSND",

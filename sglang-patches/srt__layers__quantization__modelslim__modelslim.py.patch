@@ -1,0 +1,76 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/layers/quantization/modelslim/modelslim.py /data/models/mtp_experiment_0907/sglang/srt/layers/quantization/modelslim/modelslim.py
+--- /tmp/stock_sglang/sglang/srt/layers/quantization/modelslim/modelslim.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/layers/quantization/modelslim/modelslim.py	2026-09-04 10:53:48.795455610 +0800
+@@ -1,4 +1,5 @@
+ from __future__ import annotations
++import re
+ 
+ import logging
+ from types import MappingProxyType
+@@ -291,7 +292,9 @@
+         elif isinstance(layer, FusedMoE):
+             moe_schemes = self.get_moe_scheme(layer, prefix)
+             if moe_schemes is None:
+-                raise ValueError(f"No ModelSlim MoE scheme found for layer {prefix}")
++                # 0904: extra (MTP/nextn) layer beyond the quantized set --
++                # let FusedMoE fall back to UnquantizedFusedMoEMethod (BF16).
++                return None
+             layer.w13_scheme, layer.w2_scheme = moe_schemes
+             layer.w13_kernel, layer.w2_kernel = (
+                 layer.w13_scheme.kernel,
+@@ -331,6 +334,24 @@
+         )
+         return None
+ 
++    def _is_extra_layer_beyond_quant_set(self, prefix: str) -> bool:
++        """True if prefix's layer index exceeds every layers.N.* entry in the
++        quant description -- i.e. an appended layer (MTP/nextn) the quantizer
++        never covered. 0904."""
++        m = re.search(r"layers\.(\d+)\.", prefix)
++        if not m:
++            return False
++        idx = int(m.group(1))
++        mx = getattr(self, "_desc_max_layer", None)
++        if mx is None:
++            mx = -1
++            for k in self.quant_description:
++                km = re.search(r"layers\.(\d+)\.", k)
++                if km:
++                    mx = max(mx, int(km.group(1)))
++            self._desc_max_layer = mx
++        return mx >= 0 and idx > mx
++
+     def get_moe_scheme(
+         self,
+         layer: torch.nn.Module,
+@@ -357,6 +378,15 @@
+         w2_scheme_name = None
+         resolved_prefix = prefix
+         for candidate in self._quant_prefix_candidates(prefix):
++            # 0903 xpinke GLM-5.3-Flash W8A8: fused layer-level MoE entry
++            fused_key = candidate + ".weight"
++            if fused_key in self.quant_description:
++                fused_scheme = self.quant_description[fused_key]
++                if fused_scheme in dict(moe_quant_schemes):
++                    w13_scheme_name = fused_scheme
++                    w2_scheme_name = fused_scheme
++                    resolved_prefix = candidate
++                    break
+             for gate_name, up_name, down_name in naming_conventions:
+                 w13_keys = [
+                     f"{candidate}.0.{gate_name}.weight",
+@@ -385,6 +415,14 @@
+                 break
+ 
+         if w13_scheme_name is None:
++            # 0904: appended layer (MTP/nextn) beyond the quantized set is
++            # intentionally unquantized; fall back instead of raising.
++            if self._is_extra_layer_beyond_quant_set(prefix):
++                logger.warning(
++                    f"ModelSlim MoE description missing for extra (MTP) layer {prefix}"
++                    " -> unquantized BF16 MoE"
++                )
++                return None
+             # Build a helpful error message listing all attempted key patterns
+             all_attempted = []
+             for candidate in self._quant_prefix_candidates(prefix):

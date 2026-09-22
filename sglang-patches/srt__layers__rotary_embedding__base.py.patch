@@ -1,0 +1,38 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/layers/rotary_embedding/base.py /data/models/mtp_experiment_0907/sglang/srt/layers/rotary_embedding/base.py
+--- /tmp/stock_sglang/sglang/srt/layers/rotary_embedding/base.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/layers/rotary_embedding/base.py	2026-09-04 06:34:14.871653733 +0800
+@@ -246,6 +246,11 @@
+             fused_set_kv_buffer_arg is None
+         ), "fused_set_kv_buffer_arg is not supported for native implementation"
+ 
++        if self.rotary_dim == 0:
++            # No rope segment (GLM-5.3 qk_rope_head_dim=0, APE indexer): identity.
++            # Avoids empty-tensor view/index_select errors below.
++            return query, key
++
+         if offsets is not None:
+             positions = positions + offsets
+ 
+@@ -287,6 +292,9 @@
+         assert (
+             fused_set_kv_buffer_arg is None
+         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
++        if self.rotary_dim == 0:
++            # No rope segment (GLM-5.3 qk_rope_head_dim=0, APE indexer): identity.
++            return query, key
+         if (
+             query.dtype == torch.bfloat16
+             and self.cos_sin_cache.dtype == torch.float
+@@ -297,7 +305,11 @@
+             else:
+                 cos_sin = self.cos_sin_cache.index_select(0, positions)
+ 
+-            if fused_rope_qk_mqa is not None and query.shape[0] < 65535:
++            if (
++                fused_rope_qk_mqa is not None
++                and self.rotary_dim > 0  # GLM-5.3 qk_rope_head_dim=0 (APE indexer, no rope): fused kernel tl.arange(0, D_ROPE//2) fails to compile at 0
++                and query.shape[0] < 65535
++            ):
+                 return fused_rope_qk_mqa(
+                     query,
+                     key,

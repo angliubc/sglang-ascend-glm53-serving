@@ -1,0 +1,18 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/models/deepseek_nextn.py /data/models/mtp_experiment_0907/sglang/srt/models/deepseek_nextn.py
+--- /tmp/stock_sglang/sglang/srt/models/deepseek_nextn.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/models/deepseek_nextn.py	2026-09-04 07:05:49.292694156 +0800
+@@ -301,6 +301,14 @@
+                 ):
+                     topk_indices = cp_gather_after_forward(topk_indices, forward_batch)
+             index_topk_share.update(topk_indices)
++            if os.environ.get("SGLANG_DEBUG_DSA"):
++                _si = forward_batch.spec_info
++                logger.warning(
++                    f"NEXTN_DEBUG mode={forward_batch.forward_mode} reuse={forward_batch.reuse_dsa_topk_indices} "
++                    f"spec={type(_si).__name__} topk={None if topk_indices is None else tuple(topk_indices.shape)} "
++                    f"seed_buf={None if index_topk_share._seed_buf is None else tuple(index_topk_share._seed_buf.shape)} "
++                    f"cap={getattr(_si, 'dsa_seed_topk_capture', 'NA')} sel={getattr(_si, 'dsa_seed_topk_select', 'NA')}"
++                )
+             index_topk_share.publish()
+         finally:
+             exit_stack.close()

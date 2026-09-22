@@ -1,0 +1,113 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/layers/attention/hybrid_linear_attn_backend.py /data/models/mtp_experiment_0907/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+--- /tmp/stock_sglang/sglang/srt/layers/attention/hybrid_linear_attn_backend.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/layers/attention/hybrid_linear_attn_backend.py	2026-09-09 20:26:00.489907230 +0800
+@@ -75,6 +75,7 @@
+             is HybridReqToTokenPool.translate_mamba_indices
+         )
+         self.forward_metadata: ForwardMetadata = None
++        self._va_map_logged = False
+         self.state_indices_list = []
+         # Static (max_bs,) track-dest buffer captured by pointer, refreshed in-place
+         # each replay; the captured track-save reads this, not the InputBuffer slot.
+@@ -567,6 +568,71 @@
+                 replayssm_force_flush=replayssm_force_flush,
+             )
+ 
++
++    # ---- 0909 diag: VA->name map for crash-VA correlation (env-gated) ----
++    def _dump_va_map(self, bs: int, forward_mode):
++        import os
++        if os.environ.get("SGLANG_DUMP_VA_MAP", "0") != "1":
++            return
++        import torch as _torch
++
++        def _walk(obj, prefix, depth=0, out=None):
++            if out is None:
++                out = []
++            if depth > 2:
++                return out
++            if isinstance(obj, _torch.Tensor):
++                if obj.device.type in ("npu", "cuda") and obj.numel() > 1024:
++                    out.append((prefix, obj.data_ptr(), obj.numel() * obj.element_size(), tuple(obj.shape)))
++                return out
++            if isinstance(obj, (list, tuple)):
++                for i, v in enumerate(obj):
++                    if v is not obj:
++                        _walk(v, f"{prefix}[{i}]", depth + 1, out)
++                return out
++            if isinstance(obj, dict):
++                for k, v in list(obj.items())[:200]:
++                    _walk(v, f"{prefix}.{k}", depth + 1, out)
++                return out
++            for attr in ("conv", "temporal", "intermediate_ssm",
++                         "intermediate_conv_window", "replayssm_d", "replayssm_k",
++                         "replayssm_g", "mamba_cache"):
++                v = getattr(obj, attr, None)
++                if v is not None:
++                    _walk(v, f"{prefix}.{attr}", depth + 1, out)
++            return out
++
++        entries = []
++        mp = getattr(self.req_to_token_pool, "mamba_pool", None)
++        if mp is not None:
++            _walk(mp, "mamba_pool", 0, entries)
++            mc = getattr(mp, "mamba_cache", None)
++            if mc is not None:
++                _walk(mc, "mamba_cache", 0, entries)
++        r2t = self.req_to_token_pool
++        for attr in ("req_index_to_mamba_index_mapping", "req_to_token"):
++            v = getattr(r2t, attr, None)
++            if isinstance(v, torch.Tensor):
++                entries.append((f"req_to_token.{attr}", v.data_ptr(), v.numel() * v.element_size(), tuple(v.shape)))
++        kv = getattr(self, "token_to_kv_pool", None)
++        if kv is not None:
++            for attr in ("gpu_buffer", "kv_buffer", "buffer"):
++                v = getattr(kv, attr, None)
++                if v is not None:
++                    _walk(v, f"kv.{attr}", 0, entries)
++        _walk(self, "backend", 0, entries)
++        # 去重排序
++        seen, uniq = set(), []
++        for name, ptr, nb, shape in entries:
++            if ptr not in seen:
++                seen.add(ptr)
++                uniq.append((name, ptr, nb, shape))
++        uniq.sort(key=lambda x: x[1])
++        lines = [f"[VA_MAP] first_replay bs={bs} mode={forward_mode} entries={len(uniq)}"]
++        for name, ptr, nb, shape in uniq:
++            lines.append(f"[VA_MAP] 0x{ptr:012x} {nb/1048576:9.2f}MB {str(shape):28s} {name}")
++        logger.info("\n".join(lines))
++
+     def _replay_metadata(
+         self,
+         bs: int,
+@@ -585,6 +651,12 @@
+                 num_padding = torch.count_nonzero(
+                     seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
+                 )
++        if not self._va_map_logged:
++            self._va_map_logged = True
++            try:
++                self._dump_va_map(bs, forward_mode)
++            except Exception as _e:
++                logger.warning(f"va_map dump failed: {_e!r}")
+         if self._fused_state_indices_ok and self.replayssm_write_pos_list is None:
+             # Single-launch fast path: mapping gather + padding sentinel + store
+             # into the static buffer, plus zeroing padded req_pool_indices rows —
+@@ -1001,7 +1073,15 @@
+         ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
+ 
+     @property
+-    def data_type(self):
++    def forward_metadata(self):
++        # The hybrid wrapper never produces metadata itself; the full-attn
++        # child (e.g. the DSA backend) owns it. NPU modules read
++        # get_attn_backend().forward_metadata, which resolves to this wrapper.
++        return self.full_attn_backend.forward_metadata
++
++    @forward_metadata.setter
++    def forward_metadata(self, value):
++        self.full_attn_backend.forward_metadata = value
+         # KV-cache dtype readers (e.g. the trtllm_mla fused-rope check) reach the
+         # wrapper since split backends are wrapped once (#31439); the full-attn
+         # side owns the KV cache, so its dtype is authoritative.

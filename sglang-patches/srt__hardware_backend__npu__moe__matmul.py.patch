@@ -1,0 +1,38 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/hardware_backend/npu/moe/matmul.py /data/models/mtp_experiment_0907/sglang/srt/hardware_backend/npu/moe/matmul.py
+--- /tmp/stock_sglang/sglang/srt/hardware_backend/npu/moe/matmul.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/hardware_backend/npu/moe/matmul.py	2026-09-10 17:05:19.884823624 +0800
+@@ -38,7 +38,7 @@
+             raise AttributeError(
+                 f"Weight attribute '{weight_prefix}_weight' not found in layer"
+             )
+-        return torch.ops.npu.npu_grouped_matmul(
++        out = torch.ops.npu.npu_grouped_matmul(
+             x=[hidden_states],
+             weight=[weight] if transposed else [weight.transpose(1, 2)],
+             **scale_args,
+@@ -48,6 +48,25 @@
+             group_list=expert_tokens,
+             output_dtype=output_dtype,
+         )[0]
++        if __import__("os").environ.get("W4A8_NUMCHECK") == "1":
++            # 0910 诊断:非捕获期检查 GMM 输出(真实权重数值验证)
++            try:
++                capturing = torch.npu.is_current_stream_capturing()
++            except Exception:
++                capturing = False
++            if not capturing:
++                try:
++                    torch.npu.synchronize()
++                    _sc = scale_args.get("scale", [None])[0]
++                    print(f"[NUMCHECK] {weight_prefix} T={hidden_states.shape[0]} "
++                          f"scale={tuple(_sc.shape) if _sc is not None else None} "
++                          f"w={weight.dtype}{tuple(weight.shape)} "
++                          f"isnan={torch.isnan(out).any().item()} "
++                          f"isinf={torch.isinf(out).any().item()} "
++                          f"absmax={out.float().abs().max().item():.4g}", flush=True)
++                except Exception as _e:
++                    print(f"[NUMCHECK] {weight_prefix} err {_e}", flush=True)
++        return out
+ 
+ 
+ class GroupedMatmulSwigluQuant(BaseMatmul):

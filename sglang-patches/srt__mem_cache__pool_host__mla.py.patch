@@ -1,0 +1,16 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/mem_cache/pool_host/mla.py /data/models/mtp_experiment_0907/sglang/srt/mem_cache/pool_host/mla.py
+--- /tmp/stock_sglang/sglang/srt/mem_cache/pool_host/mla.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/mem_cache/pool_host/mla.py	2026-09-09 10:29:27.231111952 +0800
+@@ -43,6 +43,12 @@
+         transfer_kv_per_layer_mla_pf_lf,
+     )
+ if _is_npu:
++    from sglang.srt.mem_cache.pool_host.npu_direct_compat import (
++        transfer_kv_all_layer_direct_lf_pf,
++        transfer_kv_direct,
++        transfer_kv_per_layer_direct_pf_lf,
++    )
++if _is_npu:
+     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
+ 
+ logger = logging.getLogger(__name__)

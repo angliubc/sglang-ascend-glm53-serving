@@ -1,0 +1,193 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/hardware_backend/npu/quantization/moe_methods.py /data/models/mtp_experiment_0907/sglang/srt/hardware_backend/npu/quantization/moe_methods.py
+--- /tmp/stock_sglang/sglang/srt/hardware_backend/npu/quantization/moe_methods.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/hardware_backend/npu/quantization/moe_methods.py	2026-09-10 17:03:20.888021669 +0800
+@@ -179,6 +179,8 @@
+     def _get_bias_args(
+         quant_info: "AscendQuantInfo", weight_prefix: str
+     ) -> Dict[str, Any]:
++        if __import__("os").environ.get("W4A8_DROP_SCALE_BIAS") == "1":
++            return {}
+         bias = getattr(quant_info, f"{weight_prefix}_scale_bias", None)
+         if bias is None:
+             bias = getattr(quant_info, f"{weight_prefix}_weight_bias", None)
+@@ -607,18 +609,76 @@
+         scale_second = getattr(layer, f"{weight_prefix}_weight_scale_second", None)
+         bias = getattr(layer, f"{weight_prefix}_bias", None)
+ 
++        _os = __import__("os")
++        _w2_int8 = False
+         if not self.activation_use_clip:
+-            # Process scale according to per-channel or per-group
+-            processed_scale = self._process_scale(
+-                getattr(layer, f"{weight_prefix}_weight"),
+-                scale,
+-                scale_second,
+-                self.is_per_channel_weight,
+-            )
++            # 0910 微基准定案(mb6b/mb8/mb9,/tmp/):
++            #  - 3-D scale([E,1,N])→ 全扫核:读整层 288 专家权重,~1.7ms/次×84/步;
++            #  - int4 打包权重 + 2-D int64 scale → 跳空组快核(~65us),但仅当
++            #    K>=N 合法:w13(K=4096,N=512)OK;w2(K=256,N=4096)tiling 失败;
++            #  - w2 用 int8 展开(int4 值域 -8..7,无损)+ 2-D bf16 scale →
++            #    恒走快核(63us,图捕获 OK;fp32 scale 非法,须 bf16)。
++            _weight_pre = getattr(layer, f"{weight_prefix}_weight")
++            if (
++                _os.environ.get("W4A8_W2_INT8") == "1"
++                and self.is_per_channel_weight
++                and _weight_pre.dim() == 3
++                and _weight_pre.shape[2] < _weight_pre.shape[1] * 2
++            ):
++                # w2(K<N):nibble 对沿 N 展开,与 _w4a4_pack_int4 互逆
++                _b = _weight_pre.data  # [E, N/2, K] int8
++                _n = torch.empty(
++                    _b.shape[0], _b.shape[1] * 2, _b.shape[2],
++                    dtype=torch.int8, device=_b.device,
++                )
++                _n[:, 0::2, :] = ((_b + 8) & 0x0F) - 8  # 低 nibble(偶数输出通道)
++                _n[:, 1::2, :] = _b >> 4                # 高 nibble(算术右移)
++                _weight_pre.data = _n                   # [E, N, K] int8,-8..7
++                _w2_int8 = True
++                new_scale = scale.data.squeeze(-1).to(torch.bfloat16)  # [E, N]
++            elif (
++                _os.environ.get("W4A8_W13_INT8") == "1"
++                and self.is_per_channel_weight
++                and _weight_pre.dim() == 3
++                and _weight_pre.shape[2] >= _weight_pre.shape[1] * 2
++            ):
++                # 0910 v4 后备:w13(K>=N)同样 int8 展开 + 2-D bf16 scale。
++                # 依据:b2 boot 证明 int8+bf16 跳空组快核 in-server 图捕获安全
++                # (w2 同款);而 w13 int4+2-D int64 快核 in-server 捕获必挂
++                # (b1),mb10-15 单 op 无法复现。代价:权重 +12.7GB/卡。
++                # mb14:int4 只认 int64 打包 scale(bf16/fp32 被 op 拒)。
++                _b = _weight_pre.data  # [E, N/2, K] int8
++                _n = torch.empty(
++                    _b.shape[0], _b.shape[1] * 2, _b.shape[2],
++                    dtype=torch.int8, device=_b.device,
++                )
++                _n[:, 0::2, :] = ((_b + 8) & 0x0F) - 8
++                _n[:, 1::2, :] = _b >> 4
++                _weight_pre.data = _n
++                _w2_int8 = True
++                new_scale = scale.data.squeeze(-1).to(torch.bfloat16)  # [E, N]
++            else:
++                # Process scale according to per-channel or per-group
++                processed_scale = self._process_scale(
++                    _weight_pre,
++                    scale,
++                    scale_second,
++                    self.is_per_channel_weight,
++                )
++                new_scale = processed_scale.squeeze(-1)
++                if (
++                    _os.environ.get("W4A8_2D_SCALE") == "1"
++                    and new_scale.dim() == 3
++                    and new_scale.shape[1] == 1
++                    and _weight_pre.shape[2] >= _weight_pre.shape[1] * 2
++                ):
++                    # 2-D([E,N])跳空组快核,数值与 3-D 逐位一致(/tmp/mb4.py)。
++                    # 仅 K>=N 形状合法(mb8:K<N tiling 失败),即 w13。
++                    new_scale = new_scale.squeeze(1)
+             setattr(
+                 layer,
+                 f"{weight_prefix}_weight_scale",
+-                torch.nn.Parameter(processed_scale.squeeze(-1), requires_grad=False),
++                torch.nn.Parameter(new_scale, requires_grad=False),
+             )
+             if scale_second is not None:
+                 delattr(layer, f"{weight_prefix}_weight_scale_second")
+@@ -645,8 +705,10 @@
+         # Process weight
+         weight = getattr(layer, f"{weight_prefix}_weight")
+         weight.data = weight.data.transpose(1, 2).contiguous()
+-        weight.data = npu_format_cast(weight.data)
+-        weight.data = self._pack_to_int32(weight.data)
++        if __import__("os").environ.get("W4A8_SKIP_NZ") != "1":
++            weight.data = npu_format_cast(weight.data)
++        if not _w2_int8:
++            weight.data = self._pack_to_int32(weight.data)
+ 
+         # Set dispatcher output dtype
+         if weight_prefix == "w13":
+@@ -724,6 +786,22 @@
+         }
+         scale_args.update(self._get_bias_args(quant_info, weight_prefix))
+ 
++        if (
++            __import__("os").environ.get("W4A8_COMPACT_GMM") == "1"
++            and group_list_type == 1
++            and scale is not None
++            and hidden_states.shape[0] < expert_tokens.shape[0]
++        ):
++            return self._compact_grouped_matmul(
++                quant_info,
++                weight_prefix,
++                hidden_states,
++                expert_tokens,
++                pertoken_scale,
++                scale,
++                output_dtype,
++            )
++
+         return self.matmul.forward(
+             quant_info,
+             weight_prefix,
+@@ -735,6 +813,59 @@
+             **scale_args,
+         )
+ 
++    def _compact_grouped_matmul(
++        self,
++        quant_info,
++        weight_prefix: str,
++        hidden_states: torch.Tensor,
++        expert_tokens: torch.Tensor,
++        pertoken_scale: torch.Tensor,
++        scale: torch.Tensor,
++        output_dtype: torch.dtype,
++    ) -> torch.Tensor:
++        """Grouped matmul over only the ACTIVE experts (0910, v2 permutation-free).
++
++        npu_grouped_matmul reads the weights of every group in the weight
++        tensor it is given, empty or not (microbench 0910: int32-packed int4 +
++        packed scale costs a full weight read at ~440GB/s — 288-expert tensor
++        ≈0.7-1.7ms per call, 84 calls per decode step). This path gathers at
++        most min(T, E) experts into a compact tensor and runs the GMM against
++        that instead.
++
++        The selected experts are kept in ASCENDING expert-id order. Rows
++        arrive expert-sorted and every row belongs to a nonzero-count expert,
++        so dropping the empty experts leaves the row layout untouched: the
++        activations feed the GMM unpermuted and its output is returned as-is.
++        Zero-count padding experts at the tail of the selection keep every
++        shape static for graph capture.
++
++        Requires W4A8_SKIP_NZ=1 (ND-format weights are dim-0 indexable) and
++        W4A8_DROP_SCALE_BIAS=1 (no bias args). CPU logic test: 30/30 PASS
++        (/tmp/test_compact2.py).
++        """
++        weight = getattr(quant_info, f"{weight_prefix}_weight")
++        num_tokens = hidden_states.shape[0]
++        num_experts = expert_tokens.shape[0]
++        num_active = min(num_tokens, num_experts)
++
++        # Every expert with a nonzero token count is guaranteed to be included
++        # (distinct active experts <= num_tokens); the tail is zero-count
++        # padding, harmless to the GMM.
++        idx = torch.sort(torch.topk(expert_tokens, num_active).indices).values
++        cnt = expert_tokens.index_select(0, idx)
++
++        return torch.ops.npu.npu_grouped_matmul(
++            x=[hidden_states],
++            weight=[weight.index_select(0, idx)],
++            scale=[scale.index_select(0, idx)],
++            per_token_scale=[pertoken_scale],
++            split_item=2,
++            group_list_type=1,
++            group_type=0,
++            group_list=cnt,
++            output_dtype=output_dtype,
++        )[0]
++
+ 
+ # ---------------------------------------------------------------------------
+ #  NPUWNA16Int4MoEMethod

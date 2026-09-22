@@ -1,0 +1,27 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/hardware_backend/npu/memory_pool_npu.py /data/models/mtp_experiment_0907/sglang/srt/hardware_backend/npu/memory_pool_npu.py
+--- /tmp/stock_sglang/sglang/srt/hardware_backend/npu/memory_pool_npu.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/hardware_backend/npu/memory_pool_npu.py	2026-09-04 06:46:02.824482904 +0800
+@@ -700,13 +700,16 @@
+             loc.view(-1, 1),
+             cache_k.view(-1, 1, self.kv_lora_rank),
+         )
+-        torch_npu.npu_scatter_nd_update_(
+-            self.v_buffer[layer_id - self.start_layer].view(
+-                -1, 1, self.qk_rope_head_dim
+-            ),
+-            loc.view(-1, 1),
+-            cache_v.view(-1, 1, self.qk_rope_head_dim),
+-        )
++        if self.qk_rope_head_dim > 0:
++            # GLM-5.3 qk_rope_head_dim=0 (no rope segment): v_buffer is 0-width;
++            # an empty scatter would raise on view(-1, 1, 0).
++            torch_npu.npu_scatter_nd_update_(
++                self.v_buffer[layer_id - self.start_layer].view(
++                    -1, 1, self.qk_rope_head_dim
++                ),
++                loc.view(-1, 1),
++                cache_v.view(-1, 1, self.qk_rope_head_dim),
++            )
+ 
+     def set_index_k_buffer(
+         self,

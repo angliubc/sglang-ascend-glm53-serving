@@ -1,0 +1,171 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/mem_cache/memory_pool.py /data/models/mtp_experiment_0907/sglang/srt/mem_cache/memory_pool.py
+--- /tmp/stock_sglang/sglang/srt/mem_cache/memory_pool.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/mem_cache/memory_pool.py	2026-09-10 20:08:28.068890976 +0800
+@@ -4068,6 +4068,7 @@
+         end_layer: Optional[int] = None,
+         use_dsa: bool = False,
+         override_kv_cache_dim: Optional[int] = None,
++        dense_layer_ids: Optional[List[int]] = None,
+     ):
+         super().__init__(
+             size,
+@@ -4096,6 +4097,35 @@
+             else (kv_lora_rank + qk_rope_head_dim)
+         )
+ 
++        # W4A8_C8_KV=1 (NPU experiment): store the DSA latent as per-token
++        # per-128ch-group symmetric int8 with inline bf16 k/v scales in a 656B
++        # row consumed by npu_kv_quant_sparse_flash_attention (combine mode):
++        # [0:512] int8 latent | [512:640] bf16 rope zeros (NoPE) |
++        # [640:656] 4x (k_scale, v_scale) bf16 pairs.
++        self.c8_kv = (
++            use_dsa
++            and kv_lora_rank == 512
++            and qk_rope_head_dim == 0
++            and os.environ.get("W4A8_C8_KV") == "1"
++        )
++        if dense_layer_ids and not self.c8_kv:
++            raise RuntimeError("dense_layer_ids requires W4A8_C8_KV=1")
++        if self.c8_kv:
++            self.c8_row_dim = 656
++            self.c8_num_groups = kv_lora_rank // 128
++            # W4A8_C8_DENSE: allocate KV rows only for the listed (global)
++            # layer slots and translate lookups through c8_dense_map.
++            self.c8_dense_ids = (
++                [i - self.start_layer for i in dense_layer_ids]
++                if dense_layer_ids
++                else None
++            )
++            self.c8_dense_map = (
++                {gid: j for j, gid in enumerate(self.c8_dense_ids)}
++                if self.c8_dense_ids
++                else None
++            )
++
+         self._create_buffers()
+ 
+         self.data_ptrs = torch.tensor(
+@@ -4115,6 +4145,21 @@
+                 else nullcontext()
+             ):
+                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
++                if getattr(self, "c8_kv", False):
++                    n_bufs = (
++                        len(self.c8_dense_ids)
++                        if getattr(self, "c8_dense_ids", None)
++                        else self.layer_num
++                    )
++                    self.kv_buffer = [
++                        torch.zeros(
++                            (self.size + self.page_size, 1, self.c8_row_dim),
++                            dtype=torch.int8,
++                            device=self.device,
++                        )
++                        for _ in range(n_bufs)
++                    ]
++                    return
+                 self.kv_buffer = [
+                     torch.zeros(
+                         (self.size + self.page_size, 1, self.kv_cache_dim),
+@@ -4145,6 +4190,10 @@
+         return kv_data_ptrs, kv_data_lens, kv_item_lens
+ 
+     def get_key_buffer(self, layer_id: int):
++        if getattr(self, "c8_kv", False):
++            raise RuntimeError(
++                "get_key_buffer is not available with W4A8_C8_KV int8 KV cache"
++            )
+         if self.layer_transfer_counter is not None:
+             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+ 
+@@ -4154,6 +4203,10 @@
+         return self.kv_buffer[layer_id - self.start_layer]
+ 
+     def get_value_buffer(self, layer_id: int):
++        if getattr(self, "c8_kv", False):
++            raise RuntimeError(
++                "get_value_buffer is not available with W4A8_C8_KV int8 KV cache"
++            )
+         if self.layer_transfer_counter is not None:
+             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+ 
+@@ -4189,6 +4242,12 @@
+         if cache_k.dtype != self.dtype:
+             cache_k = cache_k.to(self.dtype)
+ 
++        if getattr(self, "c8_kv", False):
++            self._set_kv_buffer_c8(
++                self._c8_buf_idx(layer_id - self.start_layer), loc, cache_k
++            )
++            return
++
+         if self.store_dtype != self.dtype:
+             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
+                 self.store_dtype
+@@ -4196,6 +4255,50 @@
+         else:
+             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+ 
++    def _c8_buf_idx(self, buf_idx: int) -> int:
++        """Map a global layer slot to a dense c8 buffer index (identity when
++        W4A8_C8_DENSE is off)."""
++        m = getattr(self, "c8_dense_map", None)
++        if m is None:
++            return buf_idx
++        if buf_idx not in m:
++            raise RuntimeError(f"layer slot {buf_idx} has no dense c8 KV buffer")
++        return m[buf_idx]
++
++    def _set_kv_buffer_c8(self, buf_idx: int, loc: torch.Tensor, cache_k: torch.Tensor):
++        """W4A8_C8_KV: quantize the DSA latent to per-token per-128ch-group
++        symmetric int8 and write a 656B combine-mode row (inline bf16 k/v
++        scales; rope region kept zero for NoPE)."""
++        k = cache_k.view(-1, 1, self.kv_lora_rank).float()
++        ng = self.c8_num_groups
++        kg = k.view(-1, ng, 128)
++        amax = kg.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
++        # quantize against the bf16-rounded scale the kernel will dequant with
++        s = (amax / 127.0).to(torch.bfloat16).float()  # [T, ng, 1]
++        kq = (kg / s).round().clamp(-127, 127).to(torch.int8).view(
++            -1, 1, self.kv_lora_rank
++        )
++        row = kq.new_zeros(kq.shape[0], 1, self.c8_row_dim)
++        row[:, :, : self.kv_lora_rank] = kq
++        rb = row.view(torch.bfloat16)  # [T, 1, 328]; slot = byte // 2
++        base = (self.kv_lora_rank + 128) // 2  # 320 -> scale bytes at 640
++        s_bf = s.squeeze(-1).to(torch.bfloat16)
++        for gi in range(ng):
++            rb[:, 0, base + 2 * gi] = s_bf[:, gi]  # k_scale
++            rb[:, 0, base + 2 * gi + 1] = s_bf[:, gi]  # v_scale (sharedkv)
++        self.kv_buffer[buf_idx][loc] = row
++
++    def get_c8_kv_pool(self, layer_id: int) -> torch.Tensor:
++        """Paged int8 KV pool view [pages, page, 1, 656] (PA_BSND) for
++        npu_kv_quant_sparse_flash_attention."""
++        if self.layer_transfer_counter is not None:
++            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
++        buf = self.kv_buffer[self._c8_buf_idx(layer_id - self.start_layer)]
++        num_pages = buf.shape[0] // self.page_size
++        return buf[: num_pages * self.page_size].view(
++            num_pages, self.page_size, 1, self.c8_row_dim
++        )
++
+     def _write_mla_kv_buffer(
+         self,
+         dst_buffer: torch.Tensor,
+@@ -4496,6 +4599,7 @@
+         end_layer: Optional[int] = None,
+         index_buf_size: Optional[int] = None,
+         skip_topk_layers: Optional[List[bool]] = None,
++        dense_layer_ids: Optional[List[int]] = None,
+     ):
+         override_dim = (
+             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
+@@ -4514,6 +4618,7 @@
+             end_layer,
+             use_dsa=True,
+             override_kv_cache_dim=override_dim,
++            dense_layer_ids=dense_layer_ids,
+         )
+         # self.index_k_dtype = torch.float8_e4m3fn
+         # self.index_k_scale_dtype = torch.float32

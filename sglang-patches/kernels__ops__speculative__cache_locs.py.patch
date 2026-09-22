@@ -1,0 +1,43 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/kernels/ops/speculative/cache_locs.py /data/models/mtp_experiment_0907/sglang/kernels/ops/speculative/cache_locs.py
+--- /tmp/stock_sglang/sglang/kernels/ops/speculative/cache_locs.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/kernels/ops/speculative/cache_locs.py	2026-09-10 10:43:43.982797857 +0800
+@@ -462,6 +462,39 @@
+             dtype=torch.int32,
+             device=device,
+         )
++        # 0910: cache_loc_assign_1 (AscendC) has no bounds protection; a dirty
++        # req_pool_indices/start_offset/end_offset value triggers an aivec
++        # 0x800000 MTE fault that kills all ranks (910b-33, 64-way r2).
++        # Validate + clamp, and log the dirty values for root-causing.
++        max_reqs = req_to_token.shape[0]
++        pool_len = req_to_token.shape[1]
++        bad = (
++            (req_pool_indices < 0)
++            | (req_pool_indices >= max_reqs)
++            | (start_offset < 0)
++            | (start_offset >= pool_len)
++            | (end_offset > pool_len)
++            | (end_offset <= start_offset)
++            | (end_offset - start_offset > draft_token_num)
++        )
++        if bool(bad.any()):
++            import logging
++
++            logging.error(
++                "[0910-cacheloc] dirty verify cache-loc inputs, clamped: "
++                "bad_rows=%d/%d rpi_bad=%s start_bad=%s end_bad=%s",
++                int(bad.sum()),
++                int(bad.numel()),
++                req_pool_indices[bad][:8].tolist(),
++                start_offset[bad][:8].tolist(),
++                end_offset[bad][:8].tolist(),
++            )
++            req_pool_indices = req_pool_indices.clamp(0, max_reqs - 1)
++            start_offset = start_offset.clamp(0, pool_len - 1)
++            end_offset = torch.maximum(end_offset, start_offset + 1)
++            end_offset = torch.minimum(end_offset, start_offset + draft_token_num)
++            end_offset = torch.minimum(
++                end_offset, end_offset.new_full((), pool_len))
+         torch.ops.npu.cache_loc_update(
+             req_pool_indices,
+             req_to_token,

@@ -1,0 +1,40 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/hardware_backend/npu/utils.py /data/models/mtp_experiment_0907/sglang/srt/hardware_backend/npu/utils.py
+--- /tmp/stock_sglang/sglang/srt/hardware_backend/npu/utils.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/hardware_backend/npu/utils.py	2026-09-09 10:12:06.971952534 +0800
+@@ -144,24 +144,26 @@
+         disable_custom_all_reduce=True,
+     )
+ 
+-    # handles hierarchical cache configs
++    # handles hierarchical cache configs. Like the other NPU defaults above,
++    # only replace the stock defaults ("kernel" / "page_first"): an explicit
++    # --hicache-io-backend / --hicache-mem-layout must win, e.g. DSA pools
++    # have no k/v split buffers and need the direct path.
+     if cfg.enable_hierarchical_cache:
+-        declare_resolution(
+-            args,
+-            "set_default_server_args",
+-            hicache_io_backend="kernel_ascend",
+-        )
+-        if use_mla_backend(args):
++        if cfg.hicache_io_backend == "kernel":
+             declare_resolution(
+                 args,
+                 "set_default_server_args",
+-                hicache_mem_layout="page_first_kv_split",
++                hicache_io_backend="kernel_ascend",
+             )
+-        else:
++        if cfg.hicache_mem_layout == "page_first":
+             declare_resolution(
+                 args,
+                 "set_default_server_args",
+-                hicache_mem_layout="page_first_direct",
++                hicache_mem_layout=(
++                    "page_first_kv_split"
++                    if use_mla_backend(args)
++                    else "page_first_direct"
++                ),
+             )
+ 
+ 

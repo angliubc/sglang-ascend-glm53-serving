@@ -1,0 +1,36 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/entrypoints/http_server.py /data/models/mtp_experiment_0907/sglang/srt/entrypoints/http_server.py
+--- /tmp/stock_sglang/sglang/srt/entrypoints/http_server.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/entrypoints/http_server.py	2026-09-09 21:22:26.965234388 +0800
+@@ -469,6 +469,32 @@
+     allow_headers=["*"],
+ )
+ 
++
++class _NoProxyBufferingMiddleware:
++    """0909: emit X-Accel-Buffering: no so reverse proxies (nginx) stop
++    buffering SSE streams. Without it the upstream gateway drip-feeds streams at
++    ~1/8 of direct throughput (24-way: 96 vs 838 tok/s)."""
++
++    def __init__(self, app):
++        self.app = app
++
++    async def __call__(self, scope, receive, send):
++        if scope["type"] != "http":
++            await self.app(scope, receive, send)
++            return
++
++        async def send_wrapper(message):
++            if message["type"] == "http.response.start":
++                message.setdefault("headers", []).append(
++                    (b"x-accel-buffering", b"no")
++                )
++            await send(message)
++
++        await self.app(scope, receive, send_wrapper)
++
++
++app.add_middleware(_NoProxyBufferingMiddleware)
++
+ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
+     from sglang.srt.entrypoints.http_request_decompression import (
+         RequestDecompressionMiddleware,

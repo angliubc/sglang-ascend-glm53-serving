@@ -1,0 +1,21 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/constrained/xgrammar_backend.py /data/models/mtp_experiment_0907/sglang/srt/constrained/xgrammar_backend.py
+--- /tmp/stock_sglang/sglang/srt/constrained/xgrammar_backend.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/constrained/xgrammar_backend.py	2026-09-09 17:59:16.705297134 +0800
+@@ -121,7 +121,7 @@
+ 
+     @staticmethod
+     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+-        return vocab_mask.to(device, non_blocking=True)
++        return vocab_mask.to(device)  # 0909-fix: ditto
+ 
+     def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+         if logits.device.type in {"cuda", "xpu", "musa"}:
+@@ -252,7 +252,7 @@
+ 
+     @staticmethod
+     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+-        return vocab_mask.to(device, non_blocking=True)
++        return vocab_mask.to(device)  # 0909-fix: ditto
+ 
+     @staticmethod
+     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:

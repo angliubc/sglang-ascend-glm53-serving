@@ -1,0 +1,21 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/configs/model_config.py /data/models/mtp_experiment_0907/sglang/srt/configs/model_config.py
+--- /tmp/stock_sglang/sglang/srt/configs/model_config.py	2026-08-30 17:33:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/configs/model_config.py	2026-08-30 22:31:46.000000000 +0800
+@@ -2296,3 +2296,17 @@
+         swa_attention_layer_ids = None
+         full_attention_layer_ids = None
+     return swa_attention_layer_ids, full_attention_layer_ids
++
++
++# --- glm5_next port: kpool config getters (lmsysorg) ---
++
++def get_dsa_index_kpool(config: PretrainedConfig) -> int:
++    return getattr(config, "index_kpool", 1)
++
++
++
++
++def get_dsa_index_kpool_compress(config: PretrainedConfig) -> bool:
++    return getattr(config, "index_kpool_compress", False)
++
++

@@ -1,0 +1,65 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/mem_cache/kv_cache_configurator.py /data/models/mtp_experiment_0907/sglang/srt/mem_cache/kv_cache_configurator.py
+--- /tmp/stock_sglang/sglang/srt/mem_cache/kv_cache_configurator.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/mem_cache/kv_cache_configurator.py	2026-09-10 20:47:54.553301596 +0800
+@@ -1356,6 +1356,31 @@
+             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
+         else:
+             PoolCls = DSATokenToKVPool
++        if __import__("os").environ.get("W4A8_C8_DENSE") == "1":
++            # W4A8_C8_DENSE: only the DSA layers get KV/index buffers; the
++            # pool translates global layer ids to dense buffer indices.
++            hf_cfg = self.model_config.hf_config
++            # mirror Glm5NextConfig.is_kda_layer: linear_attn_config['kda_layers']
++            # marks the KDA (mamba) layers; everything else is DSA full-attention.
++            lac = getattr(hf_cfg, "linear_attn_config", None) or {}
++            kda = set(lac.get("kda_layers", []))
++            if not kda:
++                kda = {
++                    i
++                    for i, t in enumerate(getattr(hf_cfg, "layer_types", []))
++                    if t == "linear_attention"
++                }
++            ids = [
++                i
++                for i in range(getattr(hf_cfg, "num_hidden_layers", 0))
++                if i not in kda
++            ]
++            assert ids, "W4A8_C8_DENSE could not derive DSA layer ids"
++            pool_kwargs["dense_layer_ids"] = [
++                i
++                for i in ids
++                if self.layer_info.start_layer <= i < self.layer_info.end_layer
++            ]
+         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
+             pool_kwargs["skip_topk_layers"] = [
+                 dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
+@@ -1927,12 +1952,25 @@
+ 
+         # Apply user-specified upper bound
+         if user_limit is not None:
+-            if user_limit > token_capacity:
++            if user_limit > token_capacity and (
++                __import__("os").environ.get("W4A8_C8_DENSE") == "1"
++            ):
++                # W4A8_C8_DENSE: the real dense int8 allocation is far smaller
++                # than the conservative estimator (which also misprices the
++                # EAGLE draft term); trust the explicit user limit. Boot fails
++                # loudly on OOM if the limit is wrong.
+                 logging.warning(
+-                    f"max_total_tokens={user_limit} is larger than the profiled value "
+-                    f"{token_capacity}. Use the profiled value instead."
++                    f"W4A8_C8_DENSE: using max_total_tokens={user_limit} "
++                    f"instead of the profiled value {token_capacity}."
+                 )
+-            token_capacity = min(token_capacity, user_limit)
++                token_capacity = user_limit
++            else:
++                if user_limit > token_capacity:
++                    logging.warning(
++                        f"max_total_tokens={user_limit} is larger than the profiled value "
++                        f"{token_capacity}. Use the profiled value instead."
++                    )
++                token_capacity = min(token_capacity, user_limit)
+ 
+         # Sync across PP ranks (each may have different layer counts)
+         if get_parallel().pp_size > 1:

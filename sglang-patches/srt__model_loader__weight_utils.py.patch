@@ -1,0 +1,24 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/model_loader/weight_utils.py /data/models/mtp_experiment_0907/sglang/srt/model_loader/weight_utils.py
+--- /tmp/stock_sglang/sglang/srt/model_loader/weight_utils.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/model_loader/weight_utils.py	2026-08-30 22:31:46.000000000 +0800
+@@ -1523,11 +1523,18 @@
+ LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+ 
+ 
+-def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
++def sharded_weight_loader(
++    shard_axis: int,
++    tp_rank_getter=None,
++) -> LoaderFunction:
+     """Create a weight loader that shards the weights along the given axis"""
+ 
+     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+-        tp_rank = get_parallel().attn_tp_rank
++        tp_rank = (
++            tp_rank_getter()
++            if tp_rank_getter is not None
++            else get_parallel().attn_tp_rank
++        )
+ 
+         shard_size = param.data.shape[shard_axis]
+         start_idx = tp_rank * shard_size

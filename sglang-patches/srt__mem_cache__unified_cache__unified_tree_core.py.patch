@@ -1,0 +1,28 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/mem_cache/unified_cache/unified_tree_core.py /data/models/mtp_experiment_0907/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
+--- /tmp/stock_sglang/sglang/srt/mem_cache/unified_cache/unified_tree_core.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/mem_cache/unified_cache/unified_tree_core.py	2026-09-09 12:57:47.132476545 +0800
+@@ -724,6 +724,11 @@
+ 
+             # HiCache: dead node (evicted + not backuped) — stop traversal
+             if child.evicted and not child.backuped:
++                if len(key) > 2000:  # hicache-debug
++                    logger.debug(
++                        "hicache-debug: match stopped at dead node (evicted, no backup), matched=%d remaining=%d",
++                        full_kv_hit_length, len(key),
++                    )
+                 break
+ 
+             prefix_len = child.key.match(key, page_size=self.page_size)
+@@ -786,6 +791,12 @@
+             device_indices = torch.cat(value[:best_match_device_value_len])
+         else:
+             device_indices = self._empty_match_result.device_indices
++        if len(params.key) > 2000 and self.enable_hicache:  # hicache-debug
++            logger.debug(
++                "hicache-debug: match key=%d full_kv_hit=%d dev_chunks=%d best_evicted=%s best_backuped=%s",
++                len(params.key), full_kv_hit_length, best_match_device_value_len,
++                getattr(best_match_node, 'evicted', None), getattr(best_match_node, 'backuped', None),
++            )
+         result = MatchResult(
+             device_indices=device_indices,
+             last_device_node=best_match_device_node,

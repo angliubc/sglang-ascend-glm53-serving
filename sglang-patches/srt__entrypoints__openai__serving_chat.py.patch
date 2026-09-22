@@ -1,0 +1,119 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/entrypoints/openai/serving_chat.py /data/models/mtp_experiment_0907/sglang/srt/entrypoints/openai/serving_chat.py
+--- /tmp/stock_sglang/sglang/srt/entrypoints/openai/serving_chat.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/entrypoints/openai/serving_chat.py	2026-09-09 15:31:51.020045457 +0800
+@@ -4,6 +4,7 @@
+ import json
+ import logging
+ import math
++import os
+ import time
+ import uuid
+ from enum import Enum
+@@ -1097,10 +1098,107 @@
+ 
+         return adapted_request, request
+ 
++    @staticmethod
++    def _canonical_tool_value(value: Any) -> str:
++        """Return a stable representation for tool arguments and results."""
++        if hasattr(value, "model_dump"):
++            value = value.model_dump(exclude_none=True)
++        if isinstance(value, str):
++            try:
++                value = orjson.loads(value)
++            except (orjson.JSONDecodeError, TypeError):
++                return value.strip()
++        try:
++            return orjson.dumps(value, option=orjson.OPT_SORT_KEYS).decode()
++        except (TypeError, ValueError):
++            return str(value).strip()
++
++    @classmethod
++    def _trailing_tool_rounds(
++        cls, request: ChatCompletionRequest
++    ) -> List[tuple[tuple[tuple[str, str], ...], tuple[str, ...]]]:
++        """Collect consecutive completed tool rounds at the end of the prompt."""
++        rounds = []
++        messages = request.messages
++        index = len(messages) - 1
++
++        while index >= 0:
++            results_by_id = {}
++            while index >= 0 and getattr(messages[index], "role", None) in (
++                "tool",
++                "function",
++            ):
++                message = messages[index]
++                call_id = getattr(message, "tool_call_id", None)
++                if call_id:
++                    results_by_id[call_id] = cls._canonical_tool_value(
++                        getattr(message, "content", None)
++                    )
++                index -= 1
++
++            if index < 0:
++                break
++            assistant = messages[index]
++            if getattr(assistant, "role", None) != "assistant":
++                break
++            tool_calls = getattr(assistant, "tool_calls", None) or []
++            if not tool_calls:
++                break
++
++            calls = []
++            results = []
++            complete = True
++            for call in tool_calls:
++                function = call.function
++                calls.append(
++                    (
++                        function.name or "",
++                        cls._canonical_tool_value(function.arguments),
++                    )
++                )
++                if not call.id or call.id not in results_by_id:
++                    complete = False
++                    break
++                results.append(results_by_id[call.id])
++            if not complete:
++                break
++
++            rounds.append((tuple(calls), tuple(results)))
++            index -= 1
++
++        return rounds
++
++    def _should_break_glm_tool_loop(self, request: ChatCompletionRequest) -> bool:
++        """Stop GLM from issuing a fourth identical no-progress tool round."""
++        if (
++            self.tool_call_parser != "glm47"
++            or request.tool_choice == "none"
++            or not self._effective_tools(request)
++        ):
++            return False
++        try:
++            threshold = int(os.getenv("SGLANG_GLM_TOOL_LOOP_BREAKER_THRESHOLD", "3"))
++        except ValueError:
++            threshold = 3
++        if threshold < 2:
++            return False
++
++        rounds = self._trailing_tool_rounds(request)
++        return len(rounds) >= threshold and all(
++            item == rounds[0] for item in rounds[:threshold]
++        )
++
+     def _process_messages(
+         self, request: ChatCompletionRequest, is_multimodal: bool
+     ) -> MessageProcessingResult:
+         """Process chat messages and apply chat template"""
++        if self._should_break_glm_tool_loop(request):
++            request.tool_choice = "none"
++            logger.warning(
++                "GLM tool loop breaker disabled tools for this turn after "
++                "repeated identical calls and results"
++            )
++
+         if self.default_chat_template_kwargs:
+             ctk = dict(request.chat_template_kwargs or {})
+             for k, v in self.default_chat_template_kwargs.items():

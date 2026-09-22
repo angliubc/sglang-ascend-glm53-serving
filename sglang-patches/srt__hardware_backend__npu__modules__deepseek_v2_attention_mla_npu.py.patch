@@ -1,0 +1,108 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/hardware_backend/npu/modules/deepseek_v2_attention_mla_npu.py /data/models/mtp_experiment_0907/sglang/srt/hardware_backend/npu/modules/deepseek_v2_attention_mla_npu.py
+--- /tmp/stock_sglang/sglang/srt/hardware_backend/npu/modules/deepseek_v2_attention_mla_npu.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/hardware_backend/npu/modules/deepseek_v2_attention_mla_npu.py	2026-09-07 12:17:01.464453483 +0800
+@@ -377,7 +377,7 @@
+         )
+     else:
+         fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+-        if m.rotary_emb.is_neox_style:
++        if m.rotary_emb is not None and m.rotary_emb.is_neox_style:
+             q, latent_cache = fused_qkv_a_proj_out.split(
+                 [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
+             )
+@@ -413,6 +413,7 @@
+         else:
+             if (
+                 fused_qkv_a_proj_out.shape[0] < 65535
++                and m.qk_rope_head_dim > 0  # NoPE (qk_rope=0): fused kernel requires rope>0
+                 and not dsa_use_prefill_cp(forward_batch)
+                 and not getattr(m, "_disable_npu_fused_split_qk_norm", False)
+             ):
+@@ -447,12 +448,13 @@
+ 
+         q_nope_out = q_nope_out.transpose(0, 1)
+ 
+-        if m.layer_id == 0:
+-            m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(
+-                0, positions
+-            )
++        if m.rotary_emb is not None:
++            if m.layer_id == 0:
++                m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(
++                    0, positions
++                )
+ 
+-        q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
++            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+ 
+         if dsa_use_prefill_cp(forward_batch):
+             # support allgather+rerrange
+@@ -461,18 +463,47 @@
+             )
+ 
+     if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
+-        topk_indices = m.indexer(
+-            hidden_states,
+-            q_lora,
+-            positions,
+-            forward_batch,
+-            m.layer_id,
+-            layer_scatter_modes,
+-            dynamic_scale,
+-        )
++        if (m.indexer is not None) and hasattr(m.indexer, "forward_npu"):
++            # NPU: Indexer.__call__ dispatches to forward_cuda, whose first step
++            # is `metadata = get_indexer_metadata(...)`; the ascend backend does
++            # not implement it (base returns None) so forward_cuda bails with
++            # None and the MTP draft's DSA topk seed is never produced (draft
++            # decode then feeds -1 indices into aclnnSparseFlashAttention).
++            # Call the NPU-native path (npu_lightning_indexer) directly.
++            # 0907: extended beyond is_nextn -- target layers need real top-k
++            # for >2048 contexts too (verify/prefill/decode); without this,
++            # topk stays None and verify falls back to
++            # forward_verify_paged_mla (CPU-int, graph-unsafe).
++            topk_indices = m.indexer.forward_npu(
++                hidden_states,
++                q_lora,
++                positions,
++                forward_batch,
++                m.layer_id,
++                layer_scatter_modes,
++                dynamic_scale,
++            )
++        else:
++            topk_indices = m.indexer(
++                hidden_states,
++                q_lora,
++                positions,
++                forward_batch,
++                m.layer_id,
++                layer_scatter_modes,
++                dynamic_scale,
++            )
+     else:
+         topk_indices = prev_topk_indices
+ 
++    if __import__("os").environ.get("SGLANG_DEBUG_DSA"):
++        __import__("logging").getLogger(__name__).warning(
++            f"PREP_DEBUG layer={m.layer_id} skip_topk={m.skip_topk} is_nextn={m.is_nextn} "
++            f"prev={None if prev_topk_indices is None else tuple(prev_topk_indices.shape)} "
++            f"topk={None if topk_indices is None else tuple(topk_indices.shape)} mode={forward_batch.forward_mode} "
++            f"branches={'indexer' if (not m.skip_topk or (m.is_nextn and prev_topk_indices is None)) else 'prev'}"
++        )
++
+     return (
+         q_pe,
+         k_pe,
+@@ -540,6 +571,11 @@
+     if gate is not None:
+         attn_bmm_output = m._apply_gated(attn_bmm_output, gate)
+     output, _ = m.o_proj(attn_bmm_output)
++    if __import__("os").environ.get("SGLANG_DEBUG_DSA"):
++        __import__("logging").getLogger(__name__).warning(
++            f"CORE_DEBUG layer={m.layer_id} next_skip={m.next_skip_topk} "
++            f"topk_param={None if topk_indices is None else tuple(topk_indices.shape)} mode={forward_batch.forward_mode}"
++        )
+     if not m.next_skip_topk:
+         return output, None
+     else:

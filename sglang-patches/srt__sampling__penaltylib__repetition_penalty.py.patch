@@ -1,0 +1,38 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/sampling/penaltylib/repetition_penalty.py /data/models/mtp_experiment_0907/sglang/srt/sampling/penaltylib/repetition_penalty.py
+--- /tmp/stock_sglang/sglang/srt/sampling/penaltylib/repetition_penalty.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/sampling/penaltylib/repetition_penalty.py	2026-09-09 08:14:52.735483300 +0800
+@@ -17,7 +17,7 @@
+ 
+ class BatchedRepetitionPenalizer(_BatchedPenalizer):
+     """
+-    Repetition penalizer penalizes tokens based on their presence in the generated output.
++    Repetition penalizer penalizes tokens present in the prompt or generated output (vLLM semantics).
+     """
+ 
+     is_multiplicative: bool = True
+@@ -44,6 +44,25 @@
+                 device=self.orchestrator.device,
+             )
+         ).unsqueeze_(1)
++        # vLLM-parity semantics: tokens already present in the prompt (and any
++        # previously generated tokens, e.g. after a retract/resume) are penalized
++        # too, not just tokens generated from now on. Without this, a model
++        # copying verbatim out of a long context is never discouraged, because
++        # every copied token comes from the prompt.
++        for i, req in enumerate(self.orchestrator.reqs()):
++            penalty = req.sampling_params.repetition_penalty
++            if penalty == 1.0:
++                continue
++            seen = set(getattr(req, "origin_input_ids", None) or ())
++            seen.update(getattr(req, "output_ids", None) or ())
++            if not seen:
++                continue
++            ids = torch.tensor(
++                sorted(seen), dtype=torch.int64, device=self.orchestrator.device
++            )
++            ids = ids[ids < self.orchestrator.vocab_size]
++            if ids.numel():
++                self.cumulated_repetition_penalties[i].index_fill_(0, ids, penalty)
+ 
+     def _cumulate_output_tokens(self, output_ids: torch.Tensor):
+         self.cumulated_repetition_penalties.scatter_(

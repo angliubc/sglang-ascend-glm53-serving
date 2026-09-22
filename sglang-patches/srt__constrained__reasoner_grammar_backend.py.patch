@@ -1,0 +1,98 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/constrained/reasoner_grammar_backend.py /data/models/mtp_experiment_0907/sglang/srt/constrained/reasoner_grammar_backend.py
+--- /tmp/stock_sglang/sglang/srt/constrained/reasoner_grammar_backend.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/constrained/reasoner_grammar_backend.py	2026-09-09 15:42:21.520413617 +0800
+@@ -41,6 +41,7 @@
+         think_end_ids: List[int],
+         think_excluded_token_ids: Optional[List[int]] = None,
+         max_think_tokens: int = -1,
++        min_think_tokens: int = 0,
+         enable_token_filter: bool = False,
+         token_filter_fn=None,
+         allocate_vocab_mask_fn=None,
+@@ -53,6 +54,7 @@
+         self._think_end_matcher = TokenSequenceMatcher(self.think_end_ids)
+         self.think_excluded_token_ids = think_excluded_token_ids
+         self.max_think_tokens = max_think_tokens
++        self.min_think_tokens = min_think_tokens
+         self.enable_token_filter = enable_token_filter
+         self.token_filter_fn = token_filter_fn
+         self.allocate_vocab_mask_fn = allocate_vocab_mask_fn
+@@ -143,6 +145,13 @@
+             < self.max_think_tokens
+         )
+ 
++    def _must_think_more(self):
++        return (
++            self.min_think_tokens > 0
++            and self.tokens_in_think + self._matched_think_end_tokens
++            < self.min_think_tokens
++        )
++
+     def _do_token_filter(self, vocab_mask, token_ids, idx, is_allowed=True):
+         if self.token_filter_fn is not None:
+             self.token_filter_fn(vocab_mask, token_ids, idx, is_allowed)
+@@ -152,10 +161,20 @@
+             if not self.enable_token_filter:
+                 return
+             if self._can_think_more():
+-                if self.think_excluded_token_ids is not None:
++                banned = list(self.think_excluded_token_ids or ())
++                if self._must_think_more():
++                    # Below the minimum thinking budget: also ban the think-end
++                    # sequence so the model cannot close an empty thinking block
++                    # and degenerate into copying the context verbatim.
++                    banned += [t for t in self.think_end_ids if t not in banned]
++                elif self.min_think_tokens > 0:
++                    # Minimum met: unban the think-end sequence so the model
++                    # can close thinking naturally.
++                    banned = [t for t in banned if t not in self.think_end_ids]
++                if banned:
+                     self._do_token_filter(
+                         vocab_mask,
+-                        self.think_excluded_token_ids,
++                        banned,
+                         idx,
+                         is_allowed=False,
+                     )
+@@ -196,6 +215,7 @@
+             think_end_ids=self.think_end_ids,
+             think_excluded_token_ids=self.think_excluded_token_ids,
+             max_think_tokens=self.max_think_tokens,
++            min_think_tokens=self.min_think_tokens,
+             enable_token_filter=self.enable_token_filter,
+             token_filter_fn=self.token_filter_fn,
+             allocate_vocab_mask_fn=self.allocate_vocab_mask_fn,
+@@ -264,8 +284,24 @@
+             reasoning_parser, tokenizer
+         )
+         self.max_think_tokens = envs.SGLANG_MAX_THINK_TOKENS.get()
++        self.min_think_tokens = envs.SGLANG_MIN_THINK_TOKENS.get()
++        if (
++            self.max_think_tokens >= 0
++            and self.min_think_tokens > self.max_think_tokens
++        ):
++            # A minimum above the maximum would deadlock the thinking phase:
++            # clamp so the forced close at max can always fire.
++            logger.warning(
++                "SGLANG_MIN_THINK_TOKENS (%d) > SGLANG_MAX_THINK_TOKENS (%d); "
++                "clamping the minimum to the maximum.",
++                self.min_think_tokens,
++                self.max_think_tokens,
++            )
++            self.min_think_tokens = self.max_think_tokens
+         self.enable_token_filter = self.enable_strict_thinking and (
+-            self.think_excluded_token_ids is not None or self.max_think_tokens >= 0
++            self.think_excluded_token_ids is not None
++            or self.max_think_tokens >= 0
++            or self.min_think_tokens > 0
+         )
+         if (
+             self.enable_token_filter
+@@ -309,6 +345,7 @@
+             think_end_ids=self.think_end_ids,
+             think_excluded_token_ids=self.think_excluded_token_ids,
+             max_think_tokens=self.max_think_tokens,
++            min_think_tokens=self.min_think_tokens,
+             enable_token_filter=self.enable_token_filter,
+             token_filter_fn=self._token_filter_fn,
+             allocate_vocab_mask_fn=self.grammar_backend.allocate_vocab_mask,

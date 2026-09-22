@@ -1,0 +1,30 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/speculative/eagle_worker_v2.py /data/models/mtp_experiment_0907/sglang/srt/speculative/eagle_worker_v2.py
+--- /tmp/stock_sglang/sglang/srt/speculative/eagle_worker_v2.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/speculative/eagle_worker_v2.py	2026-09-07 13:05:42.136739424 +0800
+@@ -264,6 +264,14 @@
+         # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
+         # (last verified token), not draft-decode step 0.
+         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
++        if (
++            self.dsa_index_topk is not None
++            and getattr(hf_config, "index_kpool", 1) > 1
++            and getattr(hf_config, "index_kpool_always_select_tail", False)
++        ):
++            # kpool always-select-tail widens the indexer top-k output by
++            # (kpool-1); seed buffers must match (0907 long-context port).
++            self.dsa_index_topk += getattr(hf_config, "index_kpool") - 1
+         self.seed_dsa_topk_from_draft_extend = (
+             self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+         )
+@@ -868,6 +876,11 @@
+         prefill_dsa_topk = None
+         if seed_from_extend:
+             prefill_dsa_topk = self.dsa_extend_topk_buf[:bs].clone()
++            if __import__("os").environ.get("SGLANG_DEBUG_DSA"):
++                logger.warning(
++                    f"SEED_DEBUG after_draft_extend min={int(prefill_dsa_topk.min())} "
++                    f"max={int(prefill_dsa_topk.max())} shape={tuple(prefill_dsa_topk.shape)}"
++                )
+ 
+         # Assemble the next-iter draft spec_info from the extend output.
+         use_rejection_sampling = get_spec().speculative_use_rejection_sampling

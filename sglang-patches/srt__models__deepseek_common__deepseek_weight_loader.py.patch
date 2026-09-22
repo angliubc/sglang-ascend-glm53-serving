@@ -1,0 +1,13 @@
+diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/srt/models/deepseek_common/deepseek_weight_loader.py /data/models/mtp_experiment_0907/sglang/srt/models/deepseek_common/deepseek_weight_loader.py
+--- /tmp/stock_sglang/sglang/srt/models/deepseek_common/deepseek_weight_loader.py	2026-08-29 22:18:23.000000000 +0800
++++ /data/models/mtp_experiment_0907/sglang/srt/models/deepseek_common/deepseek_weight_loader.py	2026-08-30 22:31:46.000000000 +0800
+@@ -539,6 +539,9 @@
+                 else self.model.decoder.self_attn
+             )
+ 
++            if not hasattr(self_attn, "kv_b_proj"):
++                continue
++
+             if hasattr(self_attn.kv_b_proj, "qweight"):
+                 # awq compatible, dequantize the weight if supported
+                 awq_dequantize_f = awq_dequantize_func()
