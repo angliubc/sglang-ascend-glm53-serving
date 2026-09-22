@@ -29,9 +29,10 @@ metadata:
 
 | 路径 | 内容 |
 |---|---|
-| `scripts/deploy_ep32_dp4.py` | 定型启动器（读 docker-inspect 模板构造容器；18 次 boot 的收敛结果，flag 依据全在 docstring） |
-| `patches/sglang/` | 35 个 per-file diff，对 stock `main-cann9.0.0-910b` 树，`patch -p1` 应用 |
-| `patches/deep_ep/ep_strategy.py` | 跨节点 EP 策略补丁（drop-in 替换容器内 deep_ep） |
+| `build.sh` + `Dockerfile` | **一键构建**：抽 stock 树 → 应用全部 patch → 打镜像（COPY-only 层，x86 主机可跨架构构建） |
+| `scripts/deploy_ep32_dp4.py` | 定型启动器（自包含：910B 设备/驱动挂载已内联；18 次 boot 的收敛结果，flag 依据全在 docstring） |
+| `patches/sglang/` | 35 个 per-file diff，对 stock `main-cann9.0.0-910b` 树，`patch -p3` 应用（已验证 35/35 干净应用 + 字节级复现生产树） |
+| `patches/deep_ep/ep_strategy.py` | 跨节点 EP 策略补丁（包内唯一改动文件，Dockerfile 单文件覆盖） |
 | `scripts/bench_ep32.py` | 并发阶梯（README 表的来源） |
 | `scripts/bench_decode.py` | SSE 步时探针：median gap=步时，tokens/event≈accept len（A/B 必须同 prompt 同温度） |
 | `scripts/gsm8k_eval.py` | 精度回归（吞吐数字抓不到 accept 率劣化） |
@@ -41,9 +42,14 @@ metadata:
 ## 快速部署
 
 ```bash
-docker pull --platform linux/arm64 quay.io/ascend/sglang:main-cann9.0.0-910b   # 910B=aarch64, 必须显式指定
-# 抽 stock 树 → 应用 patches/sglang/*.patch → 放 deep_ep 补丁（详见 references/sglang-patches.md）
-OVERLAY_DIR=/path/to/overlay WEIGHTS_DIR=/path/to/models python3 scripts/deploy_ep32_dp4.py <rank 0-3>  # 四节点各跑
+# 1) 一键构建镜像（任意 docker 主机；产物只能在 910B 上运行）
+./build.sh                                        # → sglang-ascend-glm53:ep32
+
+# 2) 四节点启动（每节点一条；master_ip = rank0 节点）
+IMAGE=sglang-ascend-glm53:ep32 WEIGHTS_DIR=/data/models \
+TRITON_CACHE_HOST=/data/models/triton_cache \
+python3 scripts/deploy_ep32_dp4.py <rank 0-3> <master_ip>
+
 # READY 判据：/health 200 之后必须再发真实生成请求（/health 不跑 forward）
 ```
 

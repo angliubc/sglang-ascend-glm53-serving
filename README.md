@@ -22,7 +22,8 @@ scripts/bench_ep32.py        concurrency scaling ladder (the throughput table's 
 scripts/bench_decode.py      SSE step-time probe (median gap = step time, tokens/event ≈ accept len)
 scripts/gsm8k_eval.py        accuracy regression (catches acceptance-rate losses throughput misses)
 scripts/verify_quant_output.py  safetensors header-only dtype-coverage auditor (EXIT=0 ≠ compressed)
-patches/sglang/              35 per-file diffs vs stock main-cann9.0.0-910b tree (patch -p1)
+build.sh + Dockerfile       one-click image build (extract stock tree -> apply patches -> build)
+patches/sglang/              35 per-file diffs vs stock main-cann9.0.0-910b tree (patch -p3, verified byte-exact reproduction)
 patches/deep_ep/ep_strategy.py  cross-node EP strategy modes (drop-in replacement)
 references/                  deep docs: deployment rationale / patch groups / deep_ep verdict / benchmarks / ops gotchas
 ```

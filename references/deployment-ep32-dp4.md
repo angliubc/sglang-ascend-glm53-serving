@@ -19,11 +19,13 @@ API: rank0 node :8077, model name "glm-5"
 
 `python3 deploy_ep32_dp4.py <rank 0-3>` (rank0 = master):
 
-- Reads a `docker inspect` JSON of a known-good container as the
-  HostConfig/mounts/env **template** (`running-node0-0907.json` — replace with
-  your own inspect of a working Ascend sglang container; the device mappings
-  and driver binds are load-bearing: `/dev/davinci0-7`, `/dev/davinci_manager`,
-  `/dev/hisi_hdc`, `/dev/devmm_svm`, driver/firmware/ascend_install.info binds).
+- **Self-contained**: the standard Atlas 800T A2 (910B) device mappings
+  (`/dev/davinci0-7`, `/dev/davinci_manager`, `/dev/hisi_hdc`,
+  `/dev/devmm_svm`) and driver binds (driver/firmware/ascend_install.info)
+  are inlined in the launcher — identical on every node, no container-
+  template JSON needed. The internal-only binds from the reference deployment
+  (`/common`, queue_schedule, per-model patch mounts) are deliberately
+  excluded.
 - Removes any stale container, waits for it to fully exit (30×1s poll —
   leftover HBM contexts from a half-dead container cause the next launch to
   fail with "no GPU memory for KV cache").

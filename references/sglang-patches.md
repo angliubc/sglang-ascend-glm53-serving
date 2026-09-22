@@ -5,7 +5,8 @@
 from the production serving tree that ran the EP32×DP4×NEXTN deployment
 (2026-09). Filenames mirror the tree path with `/`→`__`.
 
-Apply:
+Apply (preferred: `./build.sh` automates all of this and bakes the image;
+manual path below):
 
 ```bash
 # extract stock tree from the image once per node
@@ -13,10 +14,9 @@ docker create --name probe quay.io/ascend/sglang:main-cann9.0.0-910b
 docker cp probe:/sgl-workspace/sglang/python/sglang /data/models/sglang_full/
 docker rm probe
 
-# apply all patches (each file is a standalone unified diff, -p1 relative to
-# the sglang package root)
-cd /data/models/sglang_full/sglang
-for p in <repo>/sglang-patches/*.patch; do patch -p1 --dry-run < $p || echo "SKIP $p"; done
+# apply all patches (unified diffs vs the stock tree; patch -p3 from the
+# repo root, or -p1 equivalent inside the tree)
+cd /data/models/sglang_full
 # then without --dry-run for those that apply
 
 # serve with the overlay mounted:
