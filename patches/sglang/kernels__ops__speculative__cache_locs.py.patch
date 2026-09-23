@@ -7,7 +7,7 @@ diff -ru '--exclude=__pycache__' /tmp/stock_sglang/sglang/kernels/ops/speculativ
          )
 +        # 0910: cache_loc_assign_1 (AscendC) has no bounds protection; a dirty
 +        # req_pool_indices/start_offset/end_offset value triggers an aivec
-+        # 0x800000 MTE fault that kills all ranks (910b-33, 64-way r2).
++        # 0x800000 MTE fault that kills all ranks (one node, 64-way r2).
 +        # Validate + clamp, and log the dirty values for root-causing.
 +        max_reqs = req_to_token.shape[0]
 +        pool_len = req_to_token.shape[1]
